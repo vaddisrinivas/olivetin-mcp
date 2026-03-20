@@ -1,6 +1,6 @@
 # host-bridge — hardened MCP SSE server
 #
-# Executes approved Mac commands via OliveTin REST API on host.docker.internal:1337.
+# Executes approved actions via OliveTin REST API on host.docker.internal:1337.
 # No SSH, no Remote Login needed.
 #
 # Security layers:
@@ -18,9 +18,7 @@ RUN groupadd -r -g 10001 bridge \
 
 WORKDIR /app
 COPY requirements.txt ./requirements.txt
-COPY mcp_approval_proxy-*.whl ./
-RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt mcp_approval_proxy-*.whl \
-    && rm mcp_approval_proxy-*.whl
+RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt
 
 COPY main.py setup_google_auth.py ./
 RUN chown -R bridge:bridge /app

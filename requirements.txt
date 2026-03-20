@@ -1,8 +1,13 @@
-# host-bridge — MCP SSE server (runs in Docker)
-# FastMCP is the active server framework (replaces mcp.server.fastmcp).
+# claw-host-bridge — MCP SSE server (runs in Docker)
 fastmcp>=3.0.0
 httpx>=0.27.0
-# mcp-approval-proxy: currently installed from bundled wheel (see Dockerfile COPY step).
-# When the repo goes public, replace the wheel with the line below and delete the .whl:
-#   mcp-approval-proxy @ git+https://github.com/vaddisrinivas/mcp-approval-proxy.git
-# Also remove the COPY + wheel install lines from the Dockerfile.
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+jinja2>=3.1.0
+structlog>=24.0.0
+aiolimiter>=1.1.0
+tenacity>=8.0.0
+
+# Optional: extra approval engines (WhatsApp, webhook, etc.)
+# Uncomment to enable:
+# mcp-approval-proxy @ git+https://github.com/vaddisrinivas/mcp-approval-proxy.git
