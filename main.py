@@ -824,12 +824,12 @@ approval_fallback: Any = None
 
 class _ApprovalMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext, call_next: Any) -> Any:
-        tool_name: str = context.message.params.name
+        tool_name: str = context.message.name
 
         if tool_name in _registry.readonly_tool_names:
             return await call_next(context)
 
-        args = dict(context.message.params.arguments or {})
+        args = dict(context.message.arguments or {})
         fastmcp_ctx = getattr(context, "fastmcp_context", None)
 
         approved: bool | None = None
