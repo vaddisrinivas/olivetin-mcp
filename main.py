@@ -32,7 +32,7 @@ import mcp.types as mt
 from fastmcp import FastMCP
 from fastmcp.tools.function_tool import FunctionTool
 from mcp_approval_proxy import ApprovalMiddleware
-from mcp_approval_proxy.engines import ChainedEngine, ElicitationEngine, WhatsAppEngine
+from mcp_approval_proxy.engines import WhatsAppEngine
 from mcp_approval_proxy.transports import TransportPolicy
 from starlette.requests import Request
 from starlette.responses import JSONResponse
