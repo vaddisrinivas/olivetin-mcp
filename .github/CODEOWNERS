@@ -1,0 +1,7 @@
+# Default: lead maintainer reviews all changes
+* @vaddisrinivas
+
+# Security-sensitive files require maintainer review
+/SECURITY.md @vaddisrinivas
+/.github/ @vaddisrinivas
+/Dockerfile @vaddisrinivas

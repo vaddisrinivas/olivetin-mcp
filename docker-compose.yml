@@ -1,0 +1,30 @@
+# Example: run olivetin-mcp alongside OliveTin for local development/testing.
+#
+# Usage:
+#   docker compose up -d
+#   # Then configure your MCP client to connect to http://localhost:9003/sse
+
+services:
+  olivetin:
+    image: jamesread/olivetin:latest
+    ports:
+      - "1337:1337"
+    volumes:
+      - ./olivetin-config.yaml:/config/config.yaml:ro
+    restart: unless-stopped
+
+  olivetin-mcp:
+    build: .
+    ports:
+      - "9003:9003"
+    environment:
+      OLIVETIN_URL: http://olivetin:1337
+      APPROVAL_BASE_URL: http://localhost:9003
+    depends_on:
+      - olivetin
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
