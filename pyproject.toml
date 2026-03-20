@@ -1,0 +1,16 @@
+[project]
+name = "nanoclaw-host-bridge"
+version = "1.0.0"
+description = "NanoClaw host-bridge — hardened MCP SSE server over OliveTin"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=3.0.0",
+    "httpx>=0.27.0",
+    "mcp-approval-proxy",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+mcp-approval-proxy = { path = "../../../mcp-approval-proxy", editable = true }

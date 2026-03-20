@@ -1,0 +1,8 @@
+# host-bridge — MCP SSE server (runs in Docker)
+# FastMCP is the active server framework (replaces mcp.server.fastmcp).
+fastmcp>=3.0.0
+httpx>=0.27.0
+# mcp-approval-proxy: currently installed from bundled wheel (see Dockerfile COPY step).
+# When the repo goes public, replace the wheel with the line below and delete the .whl:
+#   mcp-approval-proxy @ git+https://github.com/vaddisrinivas/mcp-approval-proxy.git
+# Also remove the COPY + wheel install lines from the Dockerfile.
