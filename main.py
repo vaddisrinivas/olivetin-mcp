@@ -810,6 +810,12 @@ mcp = FastMCP("claw-host-bridge", lifespan=_lifespan)
 _registry = ActionRegistry(mcp, cfg, _client)
 
 
+# ─── Pluggable approval fallback ──────────────────────────────────────────────
+# Set this to an async callable to replace URL-based pending with a custom backend.
+# Signature: async (tool_name: str, args: dict, display: str) -> bool
+# Example: olivetin_mcp.approval_fallback = my_whatsapp_handler
+approval_fallback: Any = None
+
 # ─── Approval middleware ───────────────────────────────────────────────────────
 # Intercepts every destructive tool call:
 #   1. Tries MCP elicitation (inline dialog in Claude Desktop / Code).
@@ -832,7 +838,10 @@ class _ApprovalMiddleware(Middleware):
 
         if approved is None:
             display = _registry.display_name(tool_name)
-            approved = await _approvals.pending_url_approval(tool_name, args, display)
+            if approval_fallback is not None:
+                approved = await approval_fallback(tool_name, args, display)
+            else:
+                approved = await _approvals.pending_url_approval(tool_name, args, display)
 
         if not approved:
             log.info("tool_denied", tool=tool_name)

@@ -1,5 +1,5 @@
 [project]
-name = "nanoclaw-host-bridge"
+name = "olivetin-mcp"
 version = "2.0.0"
 description = "claw-host-bridge — hardened MCP SSE server over OliveTin"
 requires-python = ">=3.11"
@@ -17,8 +17,12 @@ dependencies = [
     # "mcp-approval-proxy @ git+https://github.com/vaddisrinivas/mcp-approval-proxy.git",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.uv]
-package = false
+package = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
