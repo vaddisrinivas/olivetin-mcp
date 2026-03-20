@@ -578,7 +578,7 @@ class ActionRegistry:
     async def _rebuild(self, new_actions: dict[str, dict]) -> None:
         for name in list(self._action_tool_names):
             try:
-                self._mcp.remove_tool(name)
+                self._mcp.local_provider.remove_tool(name)
             except Exception:
                 pass
         self._action_tool_names.clear()
@@ -855,6 +855,11 @@ mcp.add_middleware(_ApprovalMiddleware())
 
 
 # ─── Pending approval HTTP routes ─────────────────────────────────────────────
+
+
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def healthz_route(_request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
 
 @mcp.custom_route("/pending", methods=["GET"], include_in_schema=False)
