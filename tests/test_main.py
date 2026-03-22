@@ -25,17 +25,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import main  # noqa: E402  (must come after sys.path insert)
 from main import (
+    _STATIC_READONLY_TOOLS,
     ActionRegistry,
     ApprovalManager,
     OliveTinClient,
     Settings,
-    _STATIC_READONLY_TOOLS,
     _approval_tmpl,
     _cleanup,
     _read_secret,
     _result_tmpl,
 )
-
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -215,6 +214,7 @@ def test_auth_headers_jwt_from_secret():
 
 def test_auth_headers_basic():
     import base64
+
     s = Settings(OLIVETIN_BASIC_USER="user", OLIVETIN_BASIC_PASS="pass")
     c = OliveTinClient(s)
     h = c.auth_headers()
@@ -340,9 +340,7 @@ async def test_client_call_succeeds_after_retry(client):
     mock_resp = MagicMock()
     mock_resp.json.return_value = {"ok": True}
     mock_resp.raise_for_status = MagicMock()
-    client._http.post = AsyncMock(
-        side_effect=[httpx.RequestError("err"), mock_resp]
-    )
+    client._http.post = AsyncMock(side_effect=[httpx.RequestError("err"), mock_resp])
 
     with patch("asyncio.sleep", new=AsyncMock()):
         result = await client.call("GetDashboard", {})
@@ -451,9 +449,7 @@ def test_make_action_model_with_choices():
 def test_make_action_model_with_dict_choices():
     action = {
         "bindingId": "x",
-        "arguments": [
-            {"name": "c", "type": "unicode", "choices": ["a", "b"]}
-        ],
+        "arguments": [{"name": "c", "type": "unicode", "choices": ["a", "b"]}],
     }
     schema = ActionRegistry._make_input_schema(action)
     assert schema["properties"]["c"]["enum"] == ["a", "b"]
@@ -620,45 +616,43 @@ async def test_run_action_validation_error(registry):
 
 async def test_run_action_success(registry, simple_action, client):
     registry._actions = {"test_action": simple_action}
-    client.call = AsyncMock(return_value={
-        "logEntry": {"output": "hello", "exitCode": 0, "executionTrackingId": "tid"}
-    })
+    client.call = AsyncMock(
+        return_value={"logEntry": {"output": "hello", "exitCode": 0, "executionTrackingId": "tid"}}
+    )
     result = await registry.run_action("test_action", {"msg": "hi"})
     assert result == "hello"
 
 
 async def test_run_action_no_output_nonzero_exit(registry, simple_action, client):
     registry._actions = {"test_action": simple_action}
-    client.call = AsyncMock(return_value={
-        "logEntry": {"output": "", "exitCode": 1, "executionTrackingId": ""}
-    })
+    client.call = AsyncMock(
+        return_value={"logEntry": {"output": "", "exitCode": 1, "executionTrackingId": ""}}
+    )
     result = await registry.run_action("test_action", {"msg": "hi"})
     assert "exit code 1" in result
 
 
 async def test_run_action_empty_output(registry, simple_action, client):
     registry._actions = {"test_action": simple_action}
-    client.call = AsyncMock(return_value={
-        "logEntry": {"output": "", "exitCode": 0, "executionTrackingId": ""}
-    })
+    client.call = AsyncMock(
+        return_value={"logEntry": {"output": "", "exitCode": 0, "executionTrackingId": ""}}
+    )
     result = await registry.run_action("test_action", {"msg": "hi"})
     assert result == "(no output)"
 
 
 async def test_run_action_blocked_with_rate_limit(registry, simple_action, client):
     registry._actions = {"test_action": simple_action}
-    client.call = AsyncMock(return_value={
-        "logEntry": {"blocked": True, "datetimeRateLimitExpires": "2099-01-01"}
-    })
+    client.call = AsyncMock(
+        return_value={"logEntry": {"blocked": True, "datetimeRateLimitExpires": "2099-01-01"}}
+    )
     result = await registry.run_action("test_action", {"msg": "hi"})
     assert "rate-limited" in result
 
 
 async def test_run_action_blocked_no_rate_limit(registry, simple_action, client):
     registry._actions = {"test_action": simple_action}
-    client.call = AsyncMock(return_value={
-        "logEntry": {"blocked": True}
-    })
+    client.call = AsyncMock(return_value={"logEntry": {"blocked": True}})
     result = await registry.run_action("test_action", {"msg": "hi"})
     assert "Blocked" in result
 
@@ -675,9 +669,9 @@ async def test_run_action_http_status_error(registry, simple_action, client):
     mock_response = MagicMock()
     mock_response.status_code = 500
     mock_response.text = "Internal error"
-    client.call = AsyncMock(side_effect=httpx.HTTPStatusError(
-        "500", request=MagicMock(), response=mock_response
-    ))
+    client.call = AsyncMock(
+        side_effect=httpx.HTTPStatusError("500", request=MagicMock(), response=mock_response)
+    )
     result = await registry.run_action("test_action", {"msg": "hi"})
     assert "500" in result
 
@@ -738,11 +732,23 @@ def test_walk_dashboard_warns_duplicate():
 
 
 async def test_reload_success(registry, client):
-    client.call = AsyncMock(return_value={
-        "dashboard": {"contents": [
-            {"action": {"bindingId": "act1", "title": "Act1", "arguments": [], "timeout": 5, "canExec": True}}
-        ]}
-    })
+    client.call = AsyncMock(
+        return_value={
+            "dashboard": {
+                "contents": [
+                    {
+                        "action": {
+                            "bindingId": "act1",
+                            "title": "Act1",
+                            "arguments": [],
+                            "timeout": 5,
+                            "canExec": True,
+                        }
+                    }
+                ]
+            }
+        }
+    )
     await registry.reload()
     assert "act1" in registry._actions
 
@@ -750,9 +756,21 @@ async def test_reload_success(registry, client):
 async def test_reload_fallback_empty_home(registry, client):
     responses = [
         {"dashboard": {"contents": []}},  # "Home" returns empty
-        {"dashboard": {"contents": [
-            {"action": {"bindingId": "act2", "title": "Act2", "arguments": [], "timeout": 5, "canExec": True}}
-        ]}},
+        {
+            "dashboard": {
+                "contents": [
+                    {
+                        "action": {
+                            "bindingId": "act2",
+                            "title": "Act2",
+                            "arguments": [],
+                            "timeout": 5,
+                            "canExec": True,
+                        }
+                    }
+                ]
+            }
+        },
     ]
     client.call = AsyncMock(side_effect=responses)
     await registry.reload()
@@ -882,11 +900,9 @@ async def test_pending_url_approval_timeout(approvals):
 
 async def test_pending_url_approval_uses_base_url():
     s = Settings(APPROVAL_BASE_URL="http://my.host:9003", SECRETS_DIR="/nonexistent")
-    mgr = ApprovalManager(s)
+    ApprovalManager(s)  # verify construction works
 
     captured_url = []
-
-    original = mgr.pending_url_approval
 
     async def patched(tool_name, args, display_name):
         token = "fake"
@@ -896,7 +912,7 @@ async def test_pending_url_approval_uses_base_url():
         fut.set_result(False)
         return False
 
-    result = await patched("tool", {}, "T")
+    await patched("tool", {}, "T")
     assert "http://my.host:9003/pending/fake" in captured_url
 
 
@@ -906,8 +922,12 @@ async def test_pending_url_approval_uses_base_url():
 def test_approve_found(approvals):
     fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
     approvals._pending["tok"] = {
-        "future": fut, "action_id": "x", "title": "X",
-        "args": {}, "created_at": time.time(), "expires_at": time.time() + 60,
+        "future": fut,
+        "action_id": "x",
+        "title": "X",
+        "args": {},
+        "created_at": time.time(),
+        "expires_at": time.time() + 60,
     }
     result = approvals.approve("tok")
     assert result is True
@@ -918,8 +938,12 @@ def test_approve_already_done(approvals):
     fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
     fut.set_result(True)
     approvals._pending["tok"] = {
-        "future": fut, "action_id": "x", "title": "X",
-        "args": {}, "created_at": time.time(), "expires_at": time.time() + 60,
+        "future": fut,
+        "action_id": "x",
+        "title": "X",
+        "args": {},
+        "created_at": time.time(),
+        "expires_at": time.time() + 60,
     }
     result = approvals.approve("tok")
     assert result is False
@@ -932,8 +956,12 @@ def test_approve_not_found(approvals):
 def test_deny_found(approvals):
     fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
     approvals._pending["tok"] = {
-        "future": fut, "action_id": "x", "title": "X",
-        "args": {}, "created_at": time.time(), "expires_at": time.time() + 60,
+        "future": fut,
+        "action_id": "x",
+        "title": "X",
+        "args": {},
+        "created_at": time.time(),
+        "expires_at": time.time() + 60,
     }
     result = approvals.deny("tok")
     assert result is True
@@ -960,8 +988,11 @@ def test_list_pending_empty(approvals):
 def test_list_pending_items(approvals):
     fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
     approvals._pending["abc123"] = {
-        "future": fut, "action_id": "deploy", "title": "Deploy",
-        "args": {"env": "prod"}, "created_at": time.time(),
+        "future": fut,
+        "action_id": "deploy",
+        "title": "Deploy",
+        "args": {"env": "prod"},
+        "created_at": time.time(),
         "expires_at": time.time() + 60,
     }
     items = approvals.list_pending()
@@ -974,11 +1005,13 @@ def test_list_pending_items(approvals):
 # ─── _ApprovalMiddleware ──────────────────────────────────────────────────────
 
 
-def _make_context(tool_name: str, arguments: dict | None = None,
-                  fastmcp_ctx: Any = None) -> MagicMock:
+def _make_context(
+    tool_name: str, arguments: dict | None = None, fastmcp_ctx: Any = None
+) -> MagicMock:
     ctx = MagicMock()
-    ctx.message.params.name = tool_name
-    ctx.message.params.arguments = arguments or {}
+    # fastmcp 3.1.1+: context.message IS CallToolRequestParams directly
+    ctx.message.name = tool_name
+    ctx.message.arguments = arguments or {}
     ctx.fastmcp_context = fastmcp_ctx
     return ctx
 
@@ -1032,10 +1065,11 @@ async def test_middleware_elicitation_timeout_falls_back_to_url():
     ctx = _make_context("deploy", {}, fastmcp_ctx)
     call_next = AsyncMock(return_value="ok")
 
-    with patch.object(main._approvals, "try_elicitation", return_value=None) as mock_elic:
-        with patch.object(main._approvals, "pending_url_approval",
-                          new=AsyncMock(return_value=True)):
-            result = await mw.on_call_tool(ctx, call_next)
+    with patch.object(main._approvals, "try_elicitation", return_value=None):
+        with patch.object(
+            main._approvals, "pending_url_approval", new=AsyncMock(return_value=True)
+        ):
+            await mw.on_call_tool(ctx, call_next)
 
     call_next.assert_called_once()
 
@@ -1047,9 +1081,8 @@ async def test_middleware_no_fastmcp_ctx_falls_back_to_url():
     ctx = _make_context("deploy", {}, fastmcp_ctx=None)
 
     call_next = AsyncMock(return_value="ok")
-    with patch.object(main._approvals, "pending_url_approval",
-                      new=AsyncMock(return_value=True)):
-        result = await mw.on_call_tool(ctx, call_next)
+    with patch.object(main._approvals, "pending_url_approval", new=AsyncMock(return_value=True)):
+        await mw.on_call_tool(ctx, call_next)
 
     call_next.assert_called_once()
 
@@ -1070,8 +1103,14 @@ async def test_pending_list_route_empty():
 async def test_pending_list_route_with_items():
     with patch.object(main, "_approvals") as mock_approvals:
         mock_approvals.list_pending.return_value = [
-            {"token": "t", "action_id": "x", "title": "X",
-             "args": {}, "approval_url": "http://x/t", "expires_in": 60}
+            {
+                "token": "t",
+                "action_id": "x",
+                "title": "X",
+                "args": {},
+                "approval_url": "http://x/t",
+                "expires_in": 60,
+            }
         ]
         request = MagicMock()
         response = await main.pending_list_route(request)
@@ -1091,7 +1130,9 @@ async def test_pending_detail_route_not_found():
 
 async def test_pending_detail_route_found():
     p = {
-        "action_id": "deploy", "title": "Deploy", "args": {"env": "prod"},
+        "action_id": "deploy",
+        "title": "Deploy",
+        "args": {"env": "prod"},
         "expires_at": time.time() + 60,
     }
     with patch.object(main, "_approvals") as mock_approvals:
@@ -1155,8 +1196,15 @@ async def test_list_pending_approvals_empty():
 
 
 async def test_list_pending_approvals_items():
-    items = [{"title": "Deploy", "action_id": "deploy",
-              "approval_url": "http://x/tok", "args": {}, "expires_in": 30}]
+    items = [
+        {
+            "title": "Deploy",
+            "action_id": "deploy",
+            "approval_url": "http://x/tok",
+            "args": {},
+            "expires_in": 30,
+        }
+    ]
     with patch.object(main._approvals, "list_pending", return_value=items):
         result = await main.list_pending_approvals()
     assert "Deploy" in result
@@ -1172,9 +1220,7 @@ async def test_brave_search_not_configured():
 async def test_brave_search_success():
     mock_resp = MagicMock()
     mock_resp.json.return_value = {
-        "web": {"results": [
-            {"title": "Result", "url": "http://x.com", "description": "desc"}
-        ]}
+        "web": {"results": [{"title": "Result", "url": "http://x.com", "description": "desc"}]}
     }
     mock_resp.raise_for_status = MagicMock()
 
@@ -1290,7 +1336,7 @@ async def test_get_execution_logs_all():
 
 async def test_get_execution_logs_by_action():
     with patch.object(main._client, "call", return_value={"entries": []}) as m:
-        result = await main.get_execution_logs(action_id="my_act")
+        await main.get_execution_logs(action_id="my_act")
     m.assert_called_with("GetActionLogs", {"actionId": "my_act"})
 
 
@@ -1349,7 +1395,7 @@ async def test_start_action_async_can_exec_false():
 async def test_start_action_async_success():
     action = {"bindingId": "x", "canExec": True, "arguments": []}
     with patch.object(main._registry, "get", return_value=action):
-        with patch.object(main._client, "call", return_value={"executionTrackingId": "tid"}) as m:
+        with patch.object(main._client, "call", return_value={"executionTrackingId": "tid"}):
             result = await main.start_action_async("x", {"k": "v"})
     assert "tid" in result
 
@@ -1360,9 +1406,11 @@ async def test_start_action_async_http_error():
     mock_response.status_code = 403
     mock_response.text = "Forbidden"
     with patch.object(main._registry, "get", return_value=action):
-        with patch.object(main._client, "call", side_effect=httpx.HTTPStatusError(
-            "403", request=MagicMock(), response=mock_response
-        )):
+        with patch.object(
+            main._client,
+            "call",
+            side_effect=httpx.HTTPStatusError("403", request=MagicMock(), response=mock_response),
+        ):
             result = await main.start_action_async("x")
     assert "403" in result
 
@@ -1386,9 +1434,11 @@ async def test_restart_action_http_error():
     mock_response = MagicMock()
     mock_response.status_code = 404
     mock_response.text = "Not found"
-    with patch.object(main._client, "call", side_effect=httpx.HTTPStatusError(
-        "404", request=MagicMock(), response=mock_response
-    )):
+    with patch.object(
+        main._client,
+        "call",
+        side_effect=httpx.HTTPStatusError("404", request=MagicMock(), response=mock_response),
+    ):
         result = await main.restart_action("tid")
     assert "404" in result
 
@@ -1506,10 +1556,14 @@ async def test_readyz_error():
 
 
 async def test_reload_actions_tool():
-    with patch.object(main._registry, "snapshot", side_effect=[
-        [{"bindingId": "a"}],   # before
-        [{"bindingId": "a"}, {"bindingId": "b"}],  # after
-    ]):
+    with patch.object(
+        main._registry,
+        "snapshot",
+        side_effect=[
+            [{"bindingId": "a"}],  # before
+            [{"bindingId": "a"}, {"bindingId": "b"}],  # after
+        ],
+    ):
         with patch.object(main._registry, "reload", new=AsyncMock()):
             result = await main.reload_actions_tool()
     assert "2" in result
@@ -1539,10 +1593,15 @@ async def test_resource_olivetin_actions_fields(simple_action):
 
 async def test_resource_olivetin_actions_choice_titles():
     action = {
-        "bindingId": "x", "title": "X", "canExec": True,
+        "bindingId": "x",
+        "title": "X",
+        "canExec": True,
         "arguments": [
-            {"name": "env", "type": "unicode",
-             "choices": [{"value": "prod", "title": "Production"}]}
+            {
+                "name": "env",
+                "type": "unicode",
+                "choices": [{"value": "prod", "title": "Production"}],
+            }
         ],
     }
     with patch.object(main._registry, "snapshot", return_value=[action]):
@@ -1590,10 +1649,19 @@ async def test_resource_olivetin_action_help_no_args(readonly_action):
 
 async def test_resource_olivetin_action_help_with_choices():
     action = {
-        "bindingId": "x", "title": "X", "canExec": True, "timeout": 5,
+        "bindingId": "x",
+        "title": "X",
+        "canExec": True,
+        "timeout": 5,
         "arguments": [
-            {"name": "env", "type": "unicode",
-             "choices": [{"value": "prod", "title": "Production"}, {"value": "dev", "title": "dev"}]}
+            {
+                "name": "env",
+                "type": "unicode",
+                "choices": [
+                    {"value": "prod", "title": "Production"},
+                    {"value": "dev", "title": "dev"},
+                ],
+            }
         ],
     }
     with patch.object(main._registry, "get", return_value=action):
@@ -1604,7 +1672,10 @@ async def test_resource_olivetin_action_help_with_choices():
 
 async def test_resource_olivetin_action_help_bare_choices():
     action = {
-        "bindingId": "x", "title": "X", "canExec": True, "timeout": 5,
+        "bindingId": "x",
+        "title": "X",
+        "canExec": True,
+        "timeout": 5,
         "arguments": [{"name": "env", "type": "unicode", "choices": ["a", "b"]}],
     }
     with patch.object(main._registry, "get", return_value=action):
@@ -1614,8 +1685,12 @@ async def test_resource_olivetin_action_help_bare_choices():
 
 async def test_resource_olivetin_action_help_with_prompt_template():
     action = {
-        "bindingId": "x", "title": "X", "canExec": True, "timeout": 5,
-        "arguments": [], "promptTemplate": "Run {{action}}",
+        "bindingId": "x",
+        "title": "X",
+        "canExec": True,
+        "timeout": 5,
+        "arguments": [],
+        "promptTemplate": "Run {{action}}",
     }
     with patch.object(main._registry, "get", return_value=action):
         result = await main.resource_olivetin_action_help("x")
@@ -1713,8 +1788,11 @@ async def test_prompt_olivetin_run_no_args():
 
 def test_approval_template_renders():
     html = _approval_tmpl.render(
-        title="Deploy", action_id="deploy", args={"env": "prod"},
-        token="abc", remaining=60,
+        title="Deploy",
+        action_id="deploy",
+        args={"env": "prod"},
+        token="abc",
+        remaining=60,
     )
     assert "Deploy" in html
     assert "prod" in html
@@ -1723,8 +1801,11 @@ def test_approval_template_renders():
 
 def test_approval_template_xss_escaped():
     html = _approval_tmpl.render(
-        title="<script>alert(1)</script>", action_id="x",
-        args={}, token="t", remaining=10,
+        title="<script>alert(1)</script>",
+        action_id="x",
+        args={},
+        token="t",
+        remaining=10,
     )
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
@@ -1742,9 +1823,9 @@ def test_result_template_renders():
 async def test_build_tool_handler_executes(registry, simple_action, client):
     """The closure inside _build_tool must call run_action when invoked."""
     registry._actions = {"test_action": simple_action}
-    client.call = AsyncMock(return_value={
-        "logEntry": {"output": "pong", "exitCode": 0, "executionTrackingId": ""}
-    })
+    client.call = AsyncMock(
+        return_value={"logEntry": {"output": "pong", "exitCode": 0, "executionTrackingId": ""}}
+    )
     tool = registry._build_tool(simple_action)
     # Call the underlying fn directly (bypasses FunctionTool wrapping)
     result = await tool.fn(msg="ping")
@@ -1805,7 +1886,8 @@ async def test_build_prompt_fn_substitutes_kwargs(registry):
 
     registry._mcp.add_prompt.side_effect = capture_add_prompt
     action = {
-        "bindingId": "greet", "title": "Greet",
+        "bindingId": "greet",
+        "title": "Greet",
         "promptTemplate": "Hello {name}, you are {age} years old.",
         "arguments": [],
     }
@@ -1822,13 +1904,13 @@ async def test_rebuild_removes_existing_tools(registry, simple_action):
     registry._action_tool_names = {"old_tool"}
     registry._prompt_names = {"old_prompt"}
     await registry._rebuild({})
-    registry._mcp.remove_tool.assert_called_with("old_tool")
+    registry._mcp.local_provider.remove_tool.assert_called_with("old_tool")
     registry._mcp.remove_prompt.assert_called_with("old_prompt")
 
 
 async def test_rebuild_remove_tool_exception_swallowed(registry):
     registry._action_tool_names = {"stale"}
-    registry._mcp.remove_tool.side_effect = Exception("already gone")
+    registry._mcp.local_provider.remove_tool.side_effect = Exception("already gone")
     await registry._rebuild({})  # should not raise
 
 
@@ -1845,8 +1927,11 @@ async def test_rebuild_registers_readonly(registry, readonly_action):
 
 async def test_rebuild_registers_prompt(registry):
     action = {
-        "bindingId": "greet", "title": "Greet",
-        "promptTemplate": "Say hello.", "arguments": [], "canExec": True,
+        "bindingId": "greet",
+        "title": "Greet",
+        "promptTemplate": "Say hello.",
+        "arguments": [],
+        "canExec": True,
     }
     await registry._rebuild({"greet": action})
     assert "olivetin_greet" in registry._prompt_names
@@ -1890,7 +1975,10 @@ async def test_lifespan_starts_and_stops():
 
 async def test_resource_olivetin_action_help_with_description():
     action = {
-        "bindingId": "x", "title": "X", "canExec": True, "timeout": 5,
+        "bindingId": "x",
+        "title": "X",
+        "canExec": True,
+        "timeout": 5,
         "description": "Does important things.",
         "arguments": [],
     }
@@ -1902,7 +1990,11 @@ async def test_resource_olivetin_action_help_with_description():
 
 async def test_resource_olivetin_action_help_can_exec_false_no_rate():
     action = {
-        "bindingId": "x", "title": "X", "canExec": False, "timeout": 5, "arguments": [],
+        "bindingId": "x",
+        "title": "X",
+        "canExec": False,
+        "timeout": 5,
+        "arguments": [],
     }
     with patch.object(main._registry, "get", return_value=action):
         result = await main.resource_olivetin_action_help("x")
@@ -1938,10 +2030,21 @@ def test_main_block_calls_mcp_run():
 
 def test_static_readonly_tools_contains_expected():
     expected = {
-        "list_pending_approvals", "brave_search", "render_diagram", "render_chart",
-        "list_olivetin_actions", "get_execution_logs", "get_execution_status",
-        "kill_action", "reload_actions",
-        "validate_argument", "whoami", "get_server_info", "get_action_binding",
-        "get_entities", "get_entity", "readyz",
+        "list_pending_approvals",
+        "brave_search",
+        "render_diagram",
+        "render_chart",
+        "list_olivetin_actions",
+        "get_execution_logs",
+        "get_execution_status",
+        "kill_action",
+        "reload_actions",
+        "validate_argument",
+        "whoami",
+        "get_server_info",
+        "get_action_binding",
+        "get_entities",
+        "get_entity",
+        "readyz",
     }
     assert expected <= _STATIC_READONLY_TOOLS

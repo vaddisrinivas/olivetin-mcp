@@ -28,9 +28,7 @@ SCOPES = [
 ]
 
 # Read OAuth client credentials from gogcli (already configured for these scopes)
-CREDS_FILE = os.path.expanduser(
-    "~/Library/Application Support/gogcli/credentials.json"
-)
+CREDS_FILE = os.path.expanduser("~/Library/Application Support/gogcli/credentials.json")
 if not os.path.exists(CREDS_FILE):
     sys.exit(f"Not found: {CREDS_FILE}\nInstall gogcli or create credentials.json manually.")
 

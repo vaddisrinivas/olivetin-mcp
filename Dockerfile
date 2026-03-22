@@ -1,6 +1,6 @@
-# host-bridge — hardened MCP SSE server
+# olivetin-mcp — hardened MCP SSE server
 #
-# Executes approved actions via OliveTin REST API on host.docker.internal:1337.
+# Executes approved actions via OliveTin REST API.
 # No SSH, no Remote Login needed.
 #
 # Security layers:
@@ -10,6 +10,10 @@
 #   4. read_only root filesystem (in compose)
 #   5. ALL Linux capabilities dropped (in compose)
 FROM python:3.12-slim
+
+LABEL org.opencontainers.image.source="https://github.com/vaddisrinivas/olivetin-mcp"
+LABEL org.opencontainers.image.description="Hardened MCP server for OliveTin with human-in-the-loop approval"
+LABEL org.opencontainers.image.licenses="MIT"
 
 USER root
 
@@ -31,7 +35,7 @@ RUN \
     pip uninstall -y pip setuptools wheel 2>/dev/null || true
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9003/sse', timeout=3)"]
+    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9003/healthz', timeout=3)"]
 
 USER bridge
 EXPOSE 9003

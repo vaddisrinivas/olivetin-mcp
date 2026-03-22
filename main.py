@@ -18,13 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import base64 as _b64
-import hashlib
 import json
 import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -138,25 +137,27 @@ _OLIVETIN_TYPE_MAP: dict[str, type] = {
 }
 
 # Static tools registered by @mcp.tool decorators — always read-only.
-_STATIC_READONLY_TOOLS = frozenset({
-    "list_pending_approvals",
-    "brave_search",
-    "render_diagram",
-    "render_chart",
-    "list_olivetin_actions",
-    "get_execution_logs",
-    "get_execution_status",
-    "kill_action",
-    "reload_actions",
-    # OliveTin RPC read-only tools
-    "validate_argument",
-    "whoami",
-    "get_server_info",
-    "get_action_binding",
-    "get_entities",
-    "get_entity",
-    "readyz",
-})
+_STATIC_READONLY_TOOLS = frozenset(
+    {
+        "list_pending_approvals",
+        "brave_search",
+        "render_diagram",
+        "render_chart",
+        "list_olivetin_actions",
+        "get_execution_logs",
+        "get_execution_status",
+        "kill_action",
+        "reload_actions",
+        # OliveTin RPC read-only tools
+        "validate_argument",
+        "whoami",
+        "get_server_info",
+        "get_action_binding",
+        "get_entities",
+        "get_entity",
+        "readyz",
+    }
+)
 
 
 # ─── HTML templates ───────────────────────────────────────────────────────────
@@ -304,7 +305,7 @@ class OliveTinClient:
         if jwt:
             headers["Authorization"] = f"Bearer {jwt}"
         if self._cfg.OLIVETIN_BASIC_USER and self._cfg.OLIVETIN_BASIC_PASS:
-            creds = _b64.b64encode(
+            creds = base64.b64encode(
                 f"{self._cfg.OLIVETIN_BASIC_USER}:{self._cfg.OLIVETIN_BASIC_PASS}".encode()
             ).decode()
             headers["Authorization"] = f"Basic {creds}"
@@ -313,7 +314,9 @@ class OliveTinClient:
     def active_auth_modes(self) -> str:
         modes = []
         if self._cfg.OLIVETIN_REMOTE_USER:
-            modes.append(f"header({self._cfg.OLIVETIN_USER_HEADER}={self._cfg.OLIVETIN_REMOTE_USER})")
+            modes.append(
+                f"header({self._cfg.OLIVETIN_USER_HEADER}={self._cfg.OLIVETIN_REMOTE_USER})"
+            )
         if self._cfg.OLIVETIN_JWT_TOKEN or _read_secret("olivetin_jwt_token"):
             modes.append("jwt")
         if self._cfg.OLIVETIN_BASIC_USER:
@@ -392,7 +395,8 @@ class ActionRegistry:
     def clean_title(action: dict) -> str:
         return (
             action.get("title", action.get("bindingId", ""))
-            .replace("[read-only]", "").replace("[READ-ONLY]", "")
+            .replace("[read-only]", "")
+            .replace("[READ-ONLY]", "")
             .strip()
         )
 
@@ -453,7 +457,8 @@ class ActionRegistry:
         icon = action.get("icon", "")
         icon_prefix = f"{icon} " if icon and not icon.startswith("<") else ""
         suffix = f" — {desc}" if desc else ""
-        approval_note = " No approval needed." if self.is_read_only(action) else " Requires human approval."
+        ro = self.is_read_only(action)
+        approval_note = " No approval needed." if ro else " Requires human approval."
         return f"{icon_prefix}{display}{suffix}{approval_note}"
 
     @staticmethod
@@ -473,7 +478,10 @@ class ActionRegistry:
         """
         action = await self.get(action_id)
         if not action:
-            return f"Unknown action '{action_id}'. Call list_olivetin_actions() to see what's available."
+            return (
+                f"Unknown action '{action_id}'. "
+                "Call list_olivetin_actions() to see what's available."
+            )
 
         if not action.get("canExec", True):
             rate_exp = action.get("datetimeRateLimitExpires", "")
@@ -496,13 +504,16 @@ class ActionRegistry:
             )
         except httpx.HTTPStatusError as exc:
             log.error("olivetin_http_error", status=exc.response.status_code, action=action_id)
-            return f"OliveTin API error {exc.response.status_code}: {exc.response.text[:500]}"
+            return f"OliveTin API error (HTTP {exc.response.status_code}) for action '{action_id}'."
         except httpx.RequestError as exc:
             log.error("olivetin_unreachable", url=cfg.OLIVETIN_URL, error=str(exc))
-            return f"Could not reach OliveTin at {cfg.OLIVETIN_URL}: {exc}"
+            return (
+                f"Could not reach OliveTin at {cfg.OLIVETIN_URL}. "
+                "Check: Is OliveTin running? Is the URL correct? Is the network accessible?"
+            )
         except Exception as exc:
             log.error("olivetin_error", action=action_id, error=str(exc))
-            return f"OliveTin error: {exc}"
+            return f"OliveTin error executing action '{action_id}'. Check server logs for details."
 
         entry = result.get("logEntry") or {}
 
@@ -562,8 +573,9 @@ class ActionRegistry:
         _prompt_fn.__name__ = prompt_name
         _prompt_fn.__doc__ = f"Prompt template for OliveTin action '{display}'."
         try:
-            self._mcp.add_prompt(_prompt_fn, name=prompt_name,
-                                  description=f"Prompt template for '{display}'.")
+            self._mcp.add_prompt(
+                _prompt_fn, name=prompt_name, description=f"Prompt template for '{display}'."
+            )
             return prompt_name
         except TypeError:
             try:
@@ -578,7 +590,7 @@ class ActionRegistry:
     async def _rebuild(self, new_actions: dict[str, dict]) -> None:
         for name in list(self._action_tool_names):
             try:
-                self._mcp.remove_tool(name)
+                self._mcp.local_provider.remove_tool(name)
             except Exception:
                 pass
         self._action_tool_names.clear()
@@ -698,7 +710,7 @@ class ApprovalManager:
                 log.info("elicitation_declined", tool=tool_name)
                 return False
             return False
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.info("elicitation_timeout", tool=tool_name)
             return None
         except Exception:
@@ -706,8 +718,7 @@ class ApprovalManager:
 
     # ── URL-based pending (stage 2) ───────────────────────────────────────────
 
-    async def pending_url_approval(self, tool_name: str, args: dict,
-                                   display_name: str) -> bool:
+    async def pending_url_approval(self, tool_name: str, args: dict, display_name: str) -> bool:
         """
         Create a pending approval entry and block until a human visits
         APPROVAL_BASE_URL/pending/<token> and clicks Approve or Deny.
@@ -727,7 +738,7 @@ class ApprovalManager:
         log.info("approval_pending", tool=tool_name, url=url)
         try:
             return await asyncio.wait_for(fut, timeout=float(self._cfg.APPROVAL_TIMEOUT_SECS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("approval_timeout", tool=tool_name)
             return False
         finally:
@@ -856,6 +867,23 @@ mcp.add_middleware(_ApprovalMiddleware())
 
 # ─── Pending approval HTTP routes ─────────────────────────────────────────────
 
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+def _html_response(content: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(content, status_code=status_code, headers=_SECURITY_HEADERS)
+
+
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def healthz_route(_request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
 
 @mcp.custom_route("/pending", methods=["GET"], include_in_schema=False)
 async def pending_list_route(_request: Request) -> JSONResponse:
@@ -867,15 +895,21 @@ async def pending_detail_route(request: Request) -> HTMLResponse:
     token = request.path_params.get("token", "")
     p = _approvals.get(token)
     if not p:
-        return HTMLResponse(
-            _result_tmpl.render(icon="❓", title="Not Found",
-                                message="Already resolved or expired."),
+        return _html_response(
+            _result_tmpl.render(
+                icon="❓", title="Not Found", message="Already resolved or expired."
+            ),
             status_code=404,
         )
-    return HTMLResponse(_approval_tmpl.render(
-        title=p["title"], action_id=p["action_id"], args=p.get("args", {}),
-        token=token, remaining=max(0, int(p["expires_at"] - time.time())),
-    ))
+    return _html_response(
+        _approval_tmpl.render(
+            title=p["title"],
+            action_id=p["action_id"],
+            args=p.get("args", {}),
+            token=token,
+            remaining=max(0, int(p["expires_at"] - time.time())),
+        )
+    )
 
 
 @mcp.custom_route("/pending/{token}/approve", methods=["POST"], include_in_schema=False)
@@ -883,17 +917,19 @@ async def pending_approve_route(request: Request) -> HTMLResponse:
     token = request.path_params.get("token", "")
     p = _approvals.get(token)
     if not p:
-        return HTMLResponse(
-            _result_tmpl.render(icon="⏰", title="Expired",
-                                message="Already resolved or expired."),
+        return _html_response(
+            _result_tmpl.render(icon="⏰", title="Expired", message="Already resolved or expired."),
             status_code=410,
         )
     _approvals.approve(token)
     log.info("approved", tool=p["action_id"], token=token[:8])
-    return HTMLResponse(_result_tmpl.render(
-        icon="✅", title="Approved",
-        message=f"Action '{p['title']}' approved. The agent will proceed.",
-    ))
+    return _html_response(
+        _result_tmpl.render(
+            icon="✅",
+            title="Approved",
+            message=f"Action '{p['title']}' approved. The agent will proceed.",
+        )
+    )
 
 
 @mcp.custom_route("/pending/{token}/deny", methods=["POST"], include_in_schema=False)
@@ -901,17 +937,19 @@ async def pending_deny_route(request: Request) -> HTMLResponse:
     token = request.path_params.get("token", "")
     p = _approvals.get(token)
     if not p:
-        return HTMLResponse(
-            _result_tmpl.render(icon="⏰", title="Expired",
-                                message="Already resolved or expired."),
+        return _html_response(
+            _result_tmpl.render(icon="⏰", title="Expired", message="Already resolved or expired."),
             status_code=410,
         )
     _approvals.deny(token)
     log.info("denied", tool=p["action_id"], token=token[:8])
-    return HTMLResponse(_result_tmpl.render(
-        icon="❌", title="Denied",
-        message=f"Action '{p['title']}' denied.",
-    ))
+    return _html_response(
+        _result_tmpl.render(
+            icon="❌",
+            title="Denied",
+            message=f"Action '{p['title']}' denied.",
+        )
+    )
 
 
 # ─── Static MCP tools ─────────────────────────────────────────────────────────
@@ -957,7 +995,7 @@ async def brave_search(query: str, count: int = 10) -> str:
     try:
         resp = await _client._http.get(
             "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": min(int(count), 20), "safesearch": "off"},
+            params={"q": query, "count": min(int(count), 20), "safesearch": "moderate"},
             headers={
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip",
@@ -987,14 +1025,21 @@ async def _cleanup(path: str, delay: int = 60) -> None:
 
 @mcp.tool(
     name="render_diagram",
-    description="Render a Mermaid diagram spec as PNG via mermaid.ink. Returns /tmp path. No approval needed.",
+    description=(
+        "Render a Mermaid diagram spec as PNG via mermaid.ink. "
+        "Returns /tmp path. No approval needed."
+    ),
     annotations=mt.ToolAnnotations(readOnlyHint=True),
 )
 async def render_diagram(spec: str) -> str:
     spec = spec.strip()
     if not spec:
         return "Error: spec is empty."
-    if re.search(r"(file://|javascript:|data:text/html)", spec, re.I):
+    if re.search(
+        r"(file://|javascript:|data:|gopher://|ftp://|dict://|ldap://|tftp://|ssh://)",
+        spec,
+        re.I,
+    ):
         return "Error: diagram spec contains disallowed content."
     assert _client._http is not None
     encoded = base64.urlsafe_b64encode(spec.encode()).decode().rstrip("=")
@@ -1004,8 +1049,8 @@ async def render_diagram(spec: str) -> str:
             headers={"User-Agent": "claw-host-bridge/2.0"},
         )
         resp.raise_for_status()
-        out = f"/tmp/diagram_{hashlib.md5(spec.encode()).hexdigest()[:8]}.png"
-        with open(out, "wb") as f:
+        fd, out = tempfile.mkstemp(suffix=".png", prefix="diagram_")
+        with os.fdopen(fd, "wb") as f:
             f.write(resp.content)
         asyncio.create_task(_cleanup(out))
         return out
@@ -1015,22 +1060,31 @@ async def render_diagram(spec: str) -> str:
 
 @mcp.tool(
     name="render_chart",
-    description="Render a Chart.js config as PNG via quickchart.io. Returns /tmp path. No approval needed.",
+    description=(
+        "Render a Chart.js config as PNG via quickchart.io. Returns /tmp path. No approval needed."
+    ),
     annotations=mt.ToolAnnotations(readOnlyHint=True),
 )
-async def render_chart(config: dict, width: int = 500, height: int = 300,
-                       background_color: str = "white") -> str:
+async def render_chart(
+    config: dict, width: int = 500, height: int = 300, background_color: str = "white"
+) -> str:
     if not config:
         return "Error: config is empty."
     assert _client._http is not None
     try:
-        resp = await _client._http.post("https://quickchart.io/chart", json={
-            "chart": config, "width": int(width), "height": int(height),
-            "backgroundColor": background_color, "format": "png",
-        })
+        resp = await _client._http.post(
+            "https://quickchart.io/chart",
+            json={
+                "chart": config,
+                "width": int(width),
+                "height": int(height),
+                "backgroundColor": background_color,
+                "format": "png",
+            },
+        )
         resp.raise_for_status()
-        out = f"/tmp/chart_{hashlib.md5(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]}.png"
-        with open(out, "wb") as f:
+        fd, out = tempfile.mkstemp(suffix=".png", prefix="chart_")
+        with os.fdopen(fd, "wb") as f:
             f.write(resp.content)
         asyncio.create_task(_cleanup(out))
         return out
@@ -1064,7 +1118,8 @@ async def list_olivetin_actions() -> str:
                     "default": arg.get("defaultValue", "") or arg.get("default", ""),
                     "choices": [
                         {"value": c["value"], "title": c.get("title", c["value"])}
-                        if isinstance(c, dict) else {"value": c, "title": c}
+                        if isinstance(c, dict)
+                        else {"value": c, "title": c}
                         for c in arg.get("choices", [])
                     ],
                 }
@@ -1107,7 +1162,10 @@ async def get_execution_logs(action_id: str = "", page_size: int = 50) -> str:
 )
 async def get_execution_status(execution_tracking_id: str) -> str:
     try:
-        result = await _client.call("ExecutionStatus", {"executionTrackingId": execution_tracking_id})
+        result = await _client.call(
+            "ExecutionStatus",
+            {"executionTrackingId": execution_tracking_id},
+        )
         return json.dumps(result, indent=2)
     except Exception as exc:
         return f"ExecutionStatus error: {exc}"
@@ -1141,7 +1199,9 @@ async def kill_action(execution_tracking_id: str) -> str:
     ),
     annotations=mt.ToolAnnotations(readOnlyHint=False, destructiveHint=True),
 )
-async def start_action_async(action_id: str, arguments: dict = {}) -> str:
+async def start_action_async(action_id: str, arguments: dict | None = None) -> str:
+    if arguments is None:
+        arguments = {}
     action = await _registry.get(action_id)
     if not action:
         return f"Unknown action '{action_id}'. Call list_olivetin_actions() first."
@@ -1159,9 +1219,11 @@ async def start_action_async(action_id: str, arguments: dict = {}) -> str:
         )
         return json.dumps(result, indent=2)
     except httpx.HTTPStatusError as exc:
-        return f"OliveTin API error {exc.response.status_code}: {exc.response.text[:500]}"
+        log.error("start_action_http_error", status=exc.response.status_code, action=action_id)
+        return f"OliveTin API error (HTTP {exc.response.status_code}) for action '{action_id}'."
     except Exception as exc:
-        return f"StartAction error: {exc}"
+        log.error("start_action_error", action=action_id, error=str(exc))
+        return f"StartAction error for '{action_id}'. Check server logs for details."
 
 
 @mcp.tool(
@@ -1178,9 +1240,11 @@ async def restart_action(execution_tracking_id: str) -> str:
         result = await _client.call("RestartAction", {"executionTrackingId": execution_tracking_id})
         return json.dumps(result, indent=2)
     except httpx.HTTPStatusError as exc:
-        return f"OliveTin API error {exc.response.status_code}: {exc.response.text[:500]}"
+        log.error("restart_action_http_error", status=exc.response.status_code)
+        return f"OliveTin API error (HTTP {exc.response.status_code}) for RestartAction."
     except Exception as exc:
-        return f"RestartAction error: {exc}"
+        log.error("restart_action_error", error=str(exc))
+        return "RestartAction error. Check server logs for details."
 
 
 @mcp.tool(
@@ -1192,8 +1256,9 @@ async def restart_action(execution_tracking_id: str) -> str:
     ),
     annotations=mt.ToolAnnotations(readOnlyHint=True),
 )
-async def validate_argument(value: str, type: str, binding_id: str = "",
-                             argument_name: str = "") -> str:
+async def validate_argument(
+    value: str, type: str, binding_id: str = "", argument_name: str = ""
+) -> str:
     try:
         payload: dict = {"value": value, "type": type}
         if binding_id:
@@ -1225,8 +1290,7 @@ async def whoami() -> str:
 @mcp.tool(
     name="get_server_info",
     description=(
-        "Return OliveTin server info and version (Init RPC). "
-        "No approval needed — read-only."
+        "Return OliveTin server info and version (Init RPC). No approval needed — read-only."
     ),
     annotations=mt.ToolAnnotations(readOnlyHint=True),
 )
@@ -1339,40 +1403,52 @@ async def reload_actions_tool() -> str:
     mime_type="application/json",
 )
 async def resource_olivetin_actions() -> str:
-    return json.dumps([
-        {
-            "id": a["bindingId"],
-            "title": a.get("title", ""),
-            "description": a.get("description") or "",
-            "icon": a.get("icon", ""),
-            "read_only": _registry.is_read_only(a),
-            "approval_required": not _registry.is_read_only(a),
-            "timeout_secs": a.get("timeout", 60),
-            "can_exec": a.get("canExec", True),
-            "rate_limit_expires": a.get("datetimeRateLimitExpires", ""),
-            "popup_on_start": a.get("popupOnStart", False),
-            "order": a.get("order", 0),
-            "args": [
-                {
-                    "name": arg["name"],
-                    "type": arg.get("type", "string"),
-                    "description": arg.get("description") or arg.get("title") or "",
-                    "default": arg.get("defaultValue", "") or arg.get("default", ""),
-                    "required": not bool(arg.get("defaultValue", "") or arg.get("default", "")),
-                    "choices": [
-                        {"value": c["value"], "title": c.get("title", c["value"])}
-                        if isinstance(c, dict) else {"value": c, "title": c}
-                        for c in arg.get("choices", [])
-                    ],
-                    "suggestions": arg.get("suggestions") or {},
-                }
-                for arg in a.get("arguments", [])
-                if arg.get("type") not in ("html", "confirmation")
-            ],
-            "prompt_template": a.get("promptTemplate") or a.get("prompt_template") or "",
-        }
-        for a in await _registry.snapshot()
-    ], indent=2)
+    return json.dumps(
+        [
+            {
+                "id": a["bindingId"],
+                "title": a.get("title", ""),
+                "description": a.get("description") or "",
+                "icon": a.get("icon", ""),
+                "read_only": _registry.is_read_only(a),
+                "approval_required": not _registry.is_read_only(a),
+                "timeout_secs": a.get("timeout", 60),
+                "can_exec": a.get("canExec", True),
+                "rate_limit_expires": a.get("datetimeRateLimitExpires", ""),
+                "popup_on_start": a.get("popupOnStart", False),
+                "order": a.get("order", 0),
+                "args": [
+                    {
+                        "name": arg["name"],
+                        "type": arg.get("type", "string"),
+                        "description": arg.get("description") or arg.get("title") or "",
+                        "default": arg.get("defaultValue", "") or arg.get("default", ""),
+                        "required": not bool(arg.get("defaultValue", "") or arg.get("default", "")),
+                        "choices": [
+                            {"value": c["value"], "title": c.get("title", c["value"])}
+                            if isinstance(c, dict)
+                            else {"value": c, "title": c}
+                            for c in arg.get("choices", [])
+                        ],
+                        "suggestions": arg.get("suggestions") or {},
+                    }
+                    for arg in a.get("arguments", [])
+                    if arg.get("type") not in ("html", "confirmation")
+                ],
+                "prompt_template": a.get("promptTemplate") or a.get("prompt_template") or "",
+            }
+            for a in await _registry.snapshot()
+        ],
+        indent=2,
+    )
+
+
+def _can_exec_label(can_exec: bool, rate_exp: str) -> str:
+    if can_exec:
+        return "Yes"
+    if rate_exp:
+        return f"No — rate-limited until {rate_exp}"
+    return "No"
 
 
 @mcp.resource(
@@ -1394,11 +1470,12 @@ async def resource_olivetin_action_help(action_id: str) -> str:
     rate_exp = action.get("datetimeRateLimitExpires", "")
 
     lines = [
-        f"# {display}", "",
+        f"# {display}",
+        "",
         f"**ID**: `{action_id}`",
         f"**Approval**: {'No — read-only' if read_only else f'Yes — visit {base}/pending/<token>'}",
         f"**Timeout**: {action.get('timeout', 60)}s",
-        f"**Can execute**: {'Yes' if can_exec else f'No — rate-limited until {rate_exp}' if rate_exp else 'No'}",
+        f"**Can execute**: {_can_exec_label(can_exec, rate_exp)}",
         f"**Order**: {action.get('order', 0)}",
         f"**Popup on start**: {'Yes' if action.get('popupOnStart') else 'No'}",
     ]
@@ -1459,7 +1536,9 @@ async def resource_olivetin_logs() -> str:
 )
 async def resource_olivetin_action_logs(action_id: str) -> str:
     if not await _registry.known(action_id):
-        return json.dumps({"error": f"Unknown action '{action_id}'. Read olivetin://actions first."})
+        return json.dumps(
+            {"error": f"Unknown action '{action_id}'. Read olivetin://actions first."}
+        )
     try:
         result = await _client.call("GetActionLogs", {"actionId": action_id})
         return json.dumps(result, indent=2)
@@ -1493,7 +1572,10 @@ async def resource_pending_approvals() -> str:
 async def prompt_olivetin_run(action_id: str, output_format: str = "plain") -> str:
     action = await _registry.get(action_id)
     if not action:
-        return f"Action '{action_id}' not found. Read olivetin://actions to discover available actions."
+        return (
+            f"Action '{action_id}' not found. "
+            "Read olivetin://actions to discover available actions."
+        )
 
     display = _registry.clean_title(action)
     args_desc = ", ".join(
@@ -1502,9 +1584,13 @@ async def prompt_olivetin_run(action_id: str, output_format: str = "plain") -> s
         if a.get("type") not in ("html", "confirmation")
     )
     format_instructions = {
-        "json": "Return the result as a JSON object with `output`, `exit_code`, and `action_id` keys.",
-        "markdown": "Format the output in a Markdown code block with appropriate syntax highlighting.",
-        "summary": "Summarise the result in 1–3 sentences, calling out any warnings or errors.",
+        "json": (
+            "Return the result as a JSON object with `output`, `exit_code`, and `action_id` keys."
+        ),
+        "markdown": (
+            "Format the output in a Markdown code block with appropriate syntax highlighting."
+        ),
+        "summary": ("Summarise the result in 1–3 sentences, calling out any warnings or errors."),
     }.get(output_format, "Return the raw output text as-is.")
 
     tpl = action.get("promptTemplate") or action.get("prompt_template") or ""
