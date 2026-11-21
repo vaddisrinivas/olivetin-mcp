@@ -1,0 +1,13 @@
+# Safe demo only. Replace with reviewed actions for your own deployment.
+listenAddressSingleHTTPFrontend: "0.0.0.0:1337"
+actions:
+  - id: ro_hello
+    title: "[read-only] Hello community"
+    shell: echo 'Hello community!'
+  - id: ro_echo
+    title: "[read-only] Echo identifier"
+    shell: echo '{{ message }}'
+    arguments:
+      - name: message
+        type: ascii_identifier
+        default: community

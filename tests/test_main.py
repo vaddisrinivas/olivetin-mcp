@@ -521,14 +521,14 @@ def test_make_description_skips_html_icon():
 
 def test_make_annotations_readonly(readonly_action):
     ann = ActionRegistry._make_annotations(readonly_action)
-    assert ann.readOnlyHint is True
-    assert ann.destructiveHint is False
+    assert ann.read_only_hint is True
+    assert ann.destructive_hint is False
 
 
 def test_make_annotations_destructive(simple_action):
     ann = ActionRegistry._make_annotations(simple_action)
-    assert ann.readOnlyHint is False
-    assert ann.destructiveHint is True
+    assert ann.read_only_hint is False
+    assert ann.destructive_hint is True
 
 
 # ─── ActionRegistry — rate limiter ────────────────────────────────────────────
@@ -906,7 +906,7 @@ async def test_pending_url_approval_uses_base_url():
 
     async def patched(tool_name, args, display_name):
         token = "fake"
-        fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         base = s.APPROVAL_BASE_URL
         captured_url.append(f"{base}/pending/{token}")
         fut.set_result(False)
@@ -919,8 +919,8 @@ async def test_pending_url_approval_uses_base_url():
 # ─── ApprovalManager — queue accessors ───────────────────────────────────────
 
 
-def test_approve_found(approvals):
-    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+async def test_approve_found(approvals):
+    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
     approvals._pending["tok"] = {
         "future": fut,
         "action_id": "x",
@@ -934,8 +934,8 @@ def test_approve_found(approvals):
     assert fut.result() is True
 
 
-def test_approve_already_done(approvals):
-    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+async def test_approve_already_done(approvals):
+    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
     fut.set_result(True)
     approvals._pending["tok"] = {
         "future": fut,
@@ -953,8 +953,8 @@ def test_approve_not_found(approvals):
     assert approvals.approve("missing") is False
 
 
-def test_deny_found(approvals):
-    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+async def test_deny_found(approvals):
+    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
     approvals._pending["tok"] = {
         "future": fut,
         "action_id": "x",
@@ -985,8 +985,8 @@ def test_list_pending_empty(approvals):
     assert approvals.list_pending() == []
 
 
-def test_list_pending_items(approvals):
-    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+async def test_list_pending_items(approvals):
+    fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
     approvals._pending["abc123"] = {
         "future": fut,
         "action_id": "deploy",
@@ -1053,7 +1053,7 @@ async def test_middleware_elicitation_denied():
     call_next = AsyncMock()
     result = await mw.on_call_tool(ctx, call_next)
     call_next.assert_not_called()
-    assert "not approved" in result[0].text
+    assert "not approved" in result.content[0].text
 
 
 async def test_middleware_elicitation_timeout_falls_back_to_url():
@@ -1273,9 +1273,10 @@ async def test_render_diagram_success():
     mock_http.get = AsyncMock(return_value=mock_resp)
 
     with patch.object(main._client, "_http", mock_http):
-        with patch("asyncio.create_task"):
+        with patch("main._cleanup", new=AsyncMock()):
             result = await main.render_diagram("graph TD; A-->B")
     assert result.endswith(".png")
+    os.unlink(result)
 
 
 async def test_render_diagram_error():
@@ -1299,9 +1300,10 @@ async def test_render_chart_success():
     mock_http.post = AsyncMock(return_value=mock_resp)
 
     with patch.object(main._client, "_http", mock_http):
-        with patch("asyncio.create_task"):
+        with patch("main._cleanup", new=AsyncMock()):
             result = await main.render_chart({"type": "bar"})
     assert result.endswith(".png")
+    os.unlink(result)
 
 
 async def test_render_chart_error():
@@ -1393,7 +1395,7 @@ async def test_start_action_async_can_exec_false():
 
 
 async def test_start_action_async_success():
-    action = {"bindingId": "x", "canExec": True, "arguments": []}
+    action = {"bindingId": "x", "canExec": True, "arguments": [{"name": "k", "type": "unicode"}]}
     with patch.object(main._registry, "get", return_value=action):
         with patch.object(main._client, "call", return_value={"executionTrackingId": "tid"}):
             result = await main.start_action_async("x", {"k": "v"})
@@ -1852,13 +1854,12 @@ def test_build_prompt_success(registry):
     registry._mcp.add_prompt.assert_called()
 
 
-def test_build_prompt_type_error_fallback(registry):
-    """When add_prompt raises TypeError (signature mismatch), fall back to no-kwargs call."""
-    registry._mcp.add_prompt.side_effect = [TypeError("unexpected kwarg"), None]
+def test_build_prompt_type_error_fails_cleanly(registry):
+    registry._mcp.add_prompt.side_effect = TypeError("invalid prompt")
     action = {"bindingId": "x", "title": "X", "promptTemplate": "Do {{thing}}.", "arguments": []}
     result = registry._build_prompt(action)
-    assert result == "olivetin_x"
-    assert registry._mcp.add_prompt.call_count == 2
+    assert result is None
+    assert registry._mcp.add_prompt.call_count == 1
 
 
 def test_build_prompt_type_error_inner_exception(registry):
@@ -1893,7 +1894,7 @@ async def test_build_prompt_fn_substitutes_kwargs(registry):
     }
     registry._build_prompt(action)
     assert captured_fn is not None
-    result = await captured_fn(name="Alice", age="30")
+    result = await captured_fn.fn(name="Alice", age="30")
     assert result == "Hello Alice, you are 30 years old."
 
 
@@ -1905,7 +1906,7 @@ async def test_rebuild_removes_existing_tools(registry, simple_action):
     registry._prompt_names = {"old_prompt"}
     await registry._rebuild({})
     registry._mcp.local_provider.remove_tool.assert_called_with("old_tool")
-    registry._mcp.remove_prompt.assert_called_with("old_prompt")
+    registry._mcp.local_provider.remove_prompt.assert_called_with("old_prompt")
 
 
 async def test_rebuild_remove_tool_exception_swallowed(registry):
@@ -1916,7 +1917,7 @@ async def test_rebuild_remove_tool_exception_swallowed(registry):
 
 async def test_rebuild_remove_prompt_exception_swallowed(registry):
     registry._prompt_names = {"stale_prompt"}
-    registry._mcp.remove_prompt.side_effect = Exception("already gone")
+    registry._mcp.local_provider.remove_prompt.side_effect = Exception("already gone")
     await registry._rebuild({})  # should not raise
 
 
@@ -2095,7 +2096,7 @@ async def test_middleware_approval_fallback_denied():
         with patch.object(main._approvals, "try_elicitation", return_value=None):
             result = await mw.on_call_tool(ctx, call_next)
         call_next.assert_not_called()
-        assert result[0].text.startswith("⛔")
+        assert result.content[0].text.startswith("⛔")
     finally:
         main.approval_fallback = original
 
@@ -2293,8 +2294,12 @@ async def test_run_action_timeout_clamped_max(registry, client):
 # ─── StartAction uses actionId not bindingId ─────────────────────────────────
 
 
-async def test_start_action_async_sends_action_id():
-    action = {"bindingId": "deploy", "canExec": True, "arguments": []}
+async def test_start_action_async_sends_binding_id():
+    action = {
+        "bindingId": "deploy",
+        "canExec": True,
+        "arguments": [{"name": "k", "type": "unicode"}],
+    }
     with patch.object(main._registry, "get", return_value=action):
         with patch.object(
             main._client,
@@ -2303,9 +2308,9 @@ async def test_start_action_async_sends_action_id():
         ) as m:
             await main.start_action_async("deploy", {"k": "v"})
     payload = m.call_args[0][1]
-    assert "actionId" in payload
-    assert "bindingId" not in payload
-    assert payload["actionId"] == "deploy"
+    assert "bindingId" in payload
+    assert "actionId" not in payload
+    assert payload["bindingId"] == "deploy"
 
 
 # ─── start_action_async None arguments handling ──────────────────────────────
@@ -2347,7 +2352,7 @@ async def test_rebuild_tool_removal_exception_logged(registry, mock_mcp):
 
 async def test_rebuild_prompt_removal_exception_logged(registry, mock_mcp):
     registry._prompt_names = {"old_prompt"}
-    mock_mcp.remove_prompt.side_effect = RuntimeError("nope")
+    mock_mcp.local_provider.remove_prompt.side_effect = RuntimeError("nope")
     await registry._rebuild({})
     assert len(registry._prompt_names) == 0
 
@@ -2357,7 +2362,7 @@ async def test_rebuild_prompt_removal_exception_logged(registry, mock_mcp):
 
 async def test_approve_multiple_times_second_ignored(approvals):
     token = "tok123"
-    fut = asyncio.get_event_loop().create_future()
+    fut = asyncio.get_running_loop().create_future()
     approvals._pending[token] = {
         "future": fut,
         "action_id": "x",
@@ -2372,7 +2377,7 @@ async def test_approve_multiple_times_second_ignored(approvals):
 
 async def test_deny_after_approve_ignored(approvals):
     token = "tok456"
-    fut = asyncio.get_event_loop().create_future()
+    fut = asyncio.get_running_loop().create_future()
     approvals._pending[token] = {
         "future": fut,
         "action_id": "x",
@@ -2387,7 +2392,7 @@ async def test_deny_after_approve_ignored(approvals):
 
 async def test_list_pending_expired_shows_zero(approvals):
     token = "expired_tok"
-    fut = asyncio.get_event_loop().create_future()
+    fut = asyncio.get_running_loop().create_future()
     approvals._pending[token] = {
         "future": fut,
         "action_id": "x",
@@ -2430,7 +2435,7 @@ def test_make_action_model_ascii_identifier_has_pattern():
     schema = ActionRegistry._make_input_schema(action)
     props = schema.get("properties", {})
     assert "pattern" in props["host"]
-    assert props["host"]["pattern"] == r"^[a-zA-Z0-9_\-]+$"
+    assert props["host"]["pattern"] == r"^[a-zA-Z0-9_.\-]+$"
 
 
 def test_make_action_model_url_has_format():
