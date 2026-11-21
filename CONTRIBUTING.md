@@ -10,7 +10,7 @@ git clone https://github.com/vaddisrinivas/olivetin-mcp.git
 cd olivetin-mcp
 
 # Install dependencies (using uv)
-uv sync --all-extras
+uv sync --frozen --all-extras
 
 # Or with pip
 pip install -e ".[test,lint]"
@@ -34,7 +34,7 @@ This runs ruff lint + format on every commit automatically.
 # Full test suite with coverage
 make test
 # or
-pytest --cov=main --cov-report=term-missing --cov-fail-under=95 tests/
+uv run --frozen pytest --cov=main --cov-report=term-missing --cov-fail-under=95 tests/
 ```
 
 ## Linting & Type Checking
@@ -63,7 +63,7 @@ ruff format .           # auto-format
 
 - Type-annotate all public functions
 - Use `structlog` for logging (no `print()` statements)
-- Keep test coverage at 100% (CI enforces >= 95%)
+- Cover observable behavior and meaningful regressions (CI enforces >= 95%)
 - Follow existing patterns in the codebase
 
 ## Code Review
@@ -71,6 +71,8 @@ ruff format .           # auto-format
 - All PRs require passing CI (tests, lint, type check, Docker build)
 - Maintainer typically reviews within 1-3 business days
 - Please update `CHANGELOG.md` for user-facing changes
+
+Run `make lock` to update both `uv.lock` and the hashed `requirements.txt` used by Docker. Ordinary development and CI use frozen installs. The integration job runs the safe example with pinned OliveTin 3000.22.0; local integration instructions are in [README.md](README.md#development). Never use production actions as integration fixtures.
 
 ## Architecture
 

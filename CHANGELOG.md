@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.2.0] - Unreleased
+
+### Added
+- Streamable HTTP on `/mcp` via `--http`; legacy `--sse` remains available.
+- Modern MCP input-required approvals alongside legacy elicitation, with expiring single-use state bound to the requested tool and arguments.
+- `get_execution_queue` for OliveTin concurrency groups and queued work.
+- Community `olivetin-operator` and `olivetin-action-author` skills.
+- Real stdio/HTTP integration tests against an isolated OliveTin 3000.22.0 demo.
+- Python 3.14 CI coverage, locked CI installs, hashed container requirements, and container smoke tests.
+
+### Fixed
+- `StartAction` now sends protobuf `bindingId`; synchronous starts retain `actionId`.
+- Write RPCs no longer retry uncertain network responses, preventing automatic duplicate execution.
+- Null dashboards fall back to default discovery; invalid refreshes retain the working catalog.
+- Defaults, choices, booleans, and unknown arguments validate consistently for sync/async starts.
+- `ascii_identifier` accepts dots, matching current OliveTin documentation.
+- Dynamic prompts register, render, and refresh through current FastMCP APIs.
+- Approval denials return protocol-valid error results; expired approvals cannot be accepted.
+- Action IDs cannot shadow built-in tools; structured logs use stderr to preserve stdio.
+- Brave Search supports its documented environment key.
+
+### Changed
+- FastMCP 4.2.3 / MCP SDK 2 and refreshed compatible dependencies; Python 3.11+ retained.
+- Docker defaults to Streamable HTTP; change the command to `--sse` to preserve older clients.
+- Host network listeners default to loopback. Docker listens on container interfaces; Compose publishes loopback only.
+- Python 3.14.9 and OliveTin 3000.22.0 container images are pinned by version and digest.
+- Container example includes a working config mount, bounded scratch space, and rotated bridge logs.
+- Security documentation now states client trust, URL token limits, missing inbound authentication, and external renderer data flow.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).

@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -33,20 +35,24 @@ import mcp.types as mt
 import structlog
 from aiolimiter import AsyncLimiter
 from fastmcp import FastMCP
+from fastmcp.prompts import PromptArgument
+from fastmcp.prompts.function_prompt import FunctionPrompt
 from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
     DeclinedElicitation,
 )
 from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.tools import InputRequiredToolResult, ToolResult
 from fastmcp.tools.function_tool import FunctionTool
 from jinja2 import BaseLoader, Environment
-from pydantic import Field, create_model
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, create_model
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from tenacity import (
-    retry,
+    AsyncRetrying,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -62,10 +68,10 @@ structlog.configure(
         structlog.dev.ConsoleRenderer(colors=False),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    logger_factory=structlog.PrintLoggerFactory(),
+    logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
     cache_logger_on_first_use=True,
 )
-log: structlog.BoundLogger = structlog.get_logger("host-bridge")
+log: structlog.BoundLogger = structlog.get_logger("olivetin-mcp")
 
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
@@ -75,6 +81,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_ignore_empty=True, case_sensitive=True)
 
     HOST_BRIDGE_PORT: int = 9003
+    HOST_BRIDGE_HOST: str = "127.0.0.1"
     OLIVETIN_URL: str = "http://host.docker.internal:1337"
     APPROVAL_TIMEOUT_SECS: int = 120
     # Public-facing URL of this bridge so humans can click approval links.
@@ -125,7 +132,7 @@ def _read_secret(name: str) -> str:
     return ""
 
 
-BRAVE_API_KEY = _read_secret("brave_api_key")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "") or _read_secret("brave_api_key")
 
 _OLIVETIN_TYPE_MAP: dict[str, type] = {
     "unicode": str,
@@ -146,6 +153,7 @@ _STATIC_READONLY_TOOLS = frozenset(
         "list_olivetin_actions",
         "get_execution_logs",
         "get_execution_status",
+        "get_execution_queue",
         "kill_action",
         "reload_actions",
         # OliveTin RPC read-only tools
@@ -156,6 +164,24 @@ _STATIC_READONLY_TOOLS = frozenset(
         "get_entities",
         "get_entity",
         "readyz",
+    }
+)
+
+_RESERVED_TOOL_NAMES = _STATIC_READONLY_TOOLS | {"start_action_async", "restart_action"}
+_RETRYABLE_READ_RPCS = frozenset(
+    {
+        "GetDashboard",
+        "GetLogs",
+        "GetActionLogs",
+        "ExecutionStatus",
+        "ValidateArgumentType",
+        "WhoAmI",
+        "Init",
+        "GetActionBinding",
+        "GetEntities",
+        "GetEntity",
+        "GetReadyz",
+        "GetExecutionQueue",
     }
 )
 
@@ -287,7 +313,7 @@ class OliveTinClient:
     async def start(self) -> None:
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=620.0, write=10.0, pool=10.0),
-            follow_redirects=True,
+            follow_redirects=False,
         )
 
     async def close(self) -> None:
@@ -323,23 +349,27 @@ class OliveTinClient:
             modes.append(f"basic({self._cfg.OLIVETIN_BASIC_USER})")
         return ", ".join(modes) if modes else "none"
 
-    @retry(
-        retry=retry_if_exception_type(httpx.RequestError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=4.0),
-        reraise=True,
-    )
-    async def call(self, endpoint: str, payload: dict, timeout: int = 30) -> dict:
-        """Call an OliveTin REST API endpoint. Retries up to 3× on transient network errors."""
+    async def call(self, endpoint: str, payload: dict, timeout: int = 30) -> dict[str, Any]:
+        """Retry known reads only; an uncertain write response must never repeat execution."""
         assert self._http is not None, "HTTP client not initialised — call start() first"
-        resp = await self._http.post(
-            f"{self._cfg.OLIVETIN_URL}/api/{endpoint}",
-            json=payload,
-            headers=self.auth_headers(),
-            timeout=timeout + 5,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        attempts = 3 if endpoint in _RETRYABLE_READ_RPCS else 1
+        async for attempt in AsyncRetrying(
+            retry=retry_if_exception_type(httpx.RequestError),
+            stop=stop_after_attempt(attempts),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=4.0),
+            reraise=True,
+        ):
+            with attempt:
+                resp = await self._http.post(
+                    f"{self._cfg.OLIVETIN_URL.rstrip('/')}/api/{endpoint}",
+                    json=payload,
+                    headers=self.auth_headers(),
+                    timeout=timeout + 5,
+                )
+                resp.raise_for_status()
+                result: dict[str, Any] = resp.json()
+                return result
+        raise RuntimeError("RPC retry loop finished without a response")  # pragma: no cover
 
 
 # ─── ActionRegistry ───────────────────────────────────────────────────────────
@@ -383,20 +413,16 @@ class ActionRegistry:
     # ── Classification helpers ────────────────────────────────────────────────
 
     @staticmethod
-    def is_read_only(action: dict) -> bool:
+    def is_read_only(action: dict[str, Any]) -> bool:
         """Convention: '[read-only]' title prefix or 'ro_' bindingId prefix bypasses approval."""
-        title = action.get("title", "").lower()
-        bid = action.get("bindingId", "").lower()
-        return title.startswith("[read-only]") or bid.startswith("ro_")
+        title: str = action.get("title", "")
+        bid: str = action.get("bindingId", "")
+        return title.lower().startswith("[read-only]") or bid.lower().startswith("ro_")
 
     @staticmethod
-    def clean_title(action: dict) -> str:
-        return (
-            action.get("title", action.get("bindingId", ""))
-            .replace("[read-only]", "")
-            .replace("[READ-ONLY]", "")
-            .strip()
-        )
+    def clean_title(action: dict[str, Any]) -> str:
+        raw: str = action.get("title", "") or action.get("bindingId", "")
+        return raw.replace("[read-only]", "").replace("[READ-ONLY]", "").strip()
 
     def display_name(self, tool_name: str) -> str:
         action = self._actions.get(tool_name)
@@ -405,7 +431,7 @@ class ActionRegistry:
     # ── Schema / tool building ────────────────────────────────────────────────
 
     @staticmethod
-    def _make_action_model(action: dict) -> type:
+    def _make_action_model(action: dict[str, Any]) -> type[BaseModel]:
         fields: dict[str, Any] = {}
         for arg in action.get("arguments", []):
             arg_type = arg.get("type", "unicode")
@@ -414,37 +440,63 @@ class ActionRegistry:
             name = arg["name"]
             py_type = _OLIVETIN_TYPE_MAP.get(arg_type, str)
             choices = [c["value"] if isinstance(c, dict) else c for c in arg.get("choices", [])]
-            default = arg.get("defaultValue", "") or arg.get("default", "")
+            default = arg.get("defaultValue", arg.get("default", ""))
             desc = arg.get("description") or arg.get("title") or None
             field_kwargs: dict[str, Any] = {}
             if desc:
                 field_kwargs["description"] = desc
             if arg_type == "ascii_identifier":
-                field_kwargs["pattern"] = r"^[a-zA-Z0-9_\-]+$"
+                field_kwargs["pattern"] = r"^[a-zA-Z0-9_.\-]+$"
             schema_extra: dict[str, Any] = {}
             if choices:
-                schema_extra["enum"] = choices
+                schema_extra["enum"] = [TypeAdapter(py_type).validate_python(c) for c in choices]
             if arg_type == "url":
                 schema_extra["format"] = "uri"
             if schema_extra:
                 field_kwargs["json_schema_extra"] = schema_extra
-            if default:
+            if default is not None and default != "":
                 fields[name] = (py_type, Field(default=default, **field_kwargs))
             else:
                 fields[name] = (py_type, Field(..., **field_kwargs))
         model_id = re.sub(r"[^a-zA-Z0-9_]", "_", action["bindingId"])
-        return create_model(f"Action_{model_id}", **fields)
+        return create_model(
+            f"Action_{model_id}",
+            __config__=ConfigDict(extra="forbid", validate_default=True),
+            **fields,
+        )
 
     @classmethod
-    def _make_input_schema(cls, action: dict) -> dict:
-        schema = cls._make_action_model(action).model_json_schema()
+    def _make_input_schema(cls, action: dict[str, Any]) -> dict[str, Any]:
+        model = cls._make_action_model(action)
+        schema: dict[str, Any] = model.model_json_schema()
         schema.pop("title", None)
         return schema
 
     @classmethod
-    def _validate_args(cls, action: dict, arguments: dict) -> str | None:
+    def _validated_arguments(cls, action: dict, arguments: dict) -> list[dict[str, str]]:
+        values = cls._make_action_model(action).model_validate(arguments).model_dump()
+        for arg in action.get("arguments", []):
+            name = arg["name"]
+            if name not in values or not arg.get("choices"):
+                continue
+            adapter: TypeAdapter[Any] = TypeAdapter(
+                _OLIVETIN_TYPE_MAP.get(arg.get("type", "unicode"), str)
+            )
+            choices = [
+                adapter.validate_python(c["value"] if isinstance(c, dict) else c)
+                for c in arg["choices"]
+            ]
+            if values[name] not in choices:
+                raise ValueError(f"{name}: value must be one of {choices!r}")
+        return [
+            {"name": name, "value": str(value).lower() if isinstance(value, bool) else str(value)}
+            for name, value in values.items()
+        ]
+
+    @classmethod
+    def _validate_args(cls, action: dict[str, Any], arguments: dict[str, Any]) -> str | None:
         try:
-            cls._make_action_model(action)(**arguments)
+            cls._validated_arguments(action, arguments)
             return None
         except Exception as exc:
             return str(exc)
@@ -462,8 +514,8 @@ class ActionRegistry:
     @staticmethod
     def _make_annotations(action: dict) -> mt.ToolAnnotations:
         if ActionRegistry.is_read_only(action):
-            return mt.ToolAnnotations(readOnlyHint=True, destructiveHint=False)
-        return mt.ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+            return mt.ToolAnnotations(read_only_hint=True, destructive_hint=False)
+        return mt.ToolAnnotations(read_only_hint=False, destructive_hint=True)
 
     # ── Action execution ──────────────────────────────────────────────────────
 
@@ -487,11 +539,10 @@ class ActionRegistry:
                 return f"Action '{action_id}' is rate-limited until {rate_exp}. Try again later."
             return f"Action '{action_id}' cannot be executed right now (canExec=false)."
 
-        err = self._validate_args(action, arguments)
-        if err:
-            return f"Validation error: {err}"
-
-        olivetin_args = [{"name": k, "value": str(v)} for k, v in arguments.items()]
+        try:
+            olivetin_args = self._validated_arguments(action, arguments)
+        except (ValueError, TypeError) as exc:
+            return f"Validation error: {exc}"
         timeout = min(max(int(action.get("timeout", 60)), 5), 600)
 
         try:
@@ -570,22 +621,38 @@ class ActionRegistry:
 
         _prompt_fn.__name__ = prompt_name
         _prompt_fn.__doc__ = f"Prompt template for OliveTin action '{display}'."
+        names = list(dict.fromkeys(re.findall(r"(?<!\{)\{([a-zA-Z_]\w*)\}(?!\})", template)))
+        # FastMCP validates and filters prompt inputs using the callable signature.
+        # Describe template placeholders without generating or evaluating Python code.
+        setattr(  # noqa: B010 -- Callable typing does not expose function signature metadata.
+            _prompt_fn,
+            "__signature__",
+            inspect.Signature(
+                [
+                    inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, annotation=str)
+                    for name in names
+                ],
+                return_annotation=str,
+            ),
+        )
+        _prompt_fn.__annotations__ = {name: str for name in names} | {"return": str}
         try:
             self._mcp.add_prompt(
-                _prompt_fn, name=prompt_name, description=f"Prompt template for '{display}'."
+                FunctionPrompt(
+                    name=prompt_name,
+                    description=f"Prompt template for '{display}'.",
+                    arguments=[PromptArgument(name=name, required=True) for name in names],
+                    fn=_prompt_fn,
+                )
             )
             return prompt_name
-        except TypeError:
-            try:
-                self._mcp.add_prompt(_prompt_fn)
-                return prompt_name
-            except Exception as exc:
-                log.warning("prompt_register_failed", prompt=prompt_name, error=str(exc))
         except Exception as exc:
             log.warning("prompt_register_failed", prompt=prompt_name, error=str(exc))
         return None
 
     async def _rebuild(self, new_actions: dict[str, dict]) -> None:
+        # Validate every tool before replacing the last working catalog.
+        tools = [self._build_tool(action) for action in new_actions.values()]
         for name in list(self._action_tool_names):
             try:
                 self._mcp.local_provider.remove_tool(name)
@@ -595,21 +662,21 @@ class ActionRegistry:
 
         for pname in list(self._prompt_names):
             try:
-                self._mcp.remove_prompt(pname)
+                self._mcp.local_provider.remove_prompt(pname)
             except Exception as exc:
                 log.debug("prompt_remove_failed", prompt=pname, error=str(exc))
         self._prompt_names.clear()
 
         new_readonly: set[str] = set()
-        for action in new_actions.values():
-            self._mcp.add_tool(self._build_tool(action))
+        for action, tool in zip(new_actions.values(), tools, strict=True):
+            self._mcp.add_tool(tool)
             bid = action["bindingId"]
             self._action_tool_names.add(bid)
             if self.is_read_only(action):
                 new_readonly.add(bid)
-            pname = self._build_prompt(action)
-            if pname:
-                self._prompt_names.add(pname)
+            new_pname: str | None = self._build_prompt(action)
+            if new_pname:
+                self._prompt_names.add(new_pname)
 
         self.readonly_tool_names = new_readonly | _STATIC_READONLY_TOOLS
 
@@ -622,6 +689,9 @@ class ActionRegistry:
                 action = item["action"]
                 bid = action.get("bindingId", "")
                 if not bid:
+                    continue
+                if bid in _RESERVED_TOOL_NAMES:
+                    log.warning("reserved_tool_name", binding_id=bid)
                     continue
                 if action.get("hidden"):
                     log.debug("skipping_hidden_action", binding_id=bid)
@@ -637,15 +707,16 @@ class ActionRegistry:
         try:
             result = await self._client.call("GetDashboard", {"title": "Home"})
             new_actions: dict[str, dict] = {}
-            self._walk_dashboard(result.get("dashboard", {}).get("contents", []), new_actions)
+            self._walk_dashboard((result.get("dashboard") or {}).get("contents", []), new_actions)
             if not new_actions:
                 result = await self._client.call("GetDashboard", {})
-                self._walk_dashboard(result.get("dashboard", {}).get("contents", []), new_actions)
+                self._walk_dashboard(
+                    (result.get("dashboard") or {}).get("contents", []), new_actions
+                )
 
             async with self._lock:
+                await self._rebuild(new_actions)
                 self._actions = new_actions
-
-            await self._rebuild(new_actions)
             log.info("actions_loaded", count=len(new_actions), ids=sorted(new_actions.keys()))
             if not new_actions:
                 log.warning("no_actions_loaded", olivetin=self._cfg.OLIVETIN_URL)
@@ -682,6 +753,62 @@ class ApprovalManager:
     def __init__(self, settings: Settings) -> None:
         self._cfg = settings
         self._pending: dict[str, dict] = {}
+        self._inline_pending: dict[str, tuple[str, str, float]] = {}
+
+    def modern_approval(
+        self, tool_name: str, args: dict, ctx: Any
+    ) -> bool | InputRequiredToolResult:
+        """Single-use approval round, bound to the exact tool/arguments and an expiry.
+
+        FastMCP seals request_state. The server retains the nonce until consumed,
+        so replay, argument substitution, restart, or another worker fails closed.
+        """
+        now = time.time()
+        self._inline_pending = {
+            token: entry for token, entry in self._inline_pending.items() if entry[2] > now
+        }
+        encoded_args = json.dumps(args, sort_keys=True, separators=(",", ":"))
+        if ctx.request_state is not None or ctx.input_responses is not None:
+            try:
+                token = json.loads(ctx.request_state or "{}")["olivetin_approval"]
+                entry = self._inline_pending.pop(token, None)
+                answer = (ctx.input_responses or {}).get("olivetin_approval")
+            except (ValueError, KeyError, TypeError):
+                return False
+            return bool(
+                entry
+                and entry[:2] == (tool_name, encoded_args)
+                and isinstance(answer, mt.ElicitResult)
+                and answer.action == "accept"
+                and (answer.content or {}).get("value") is True
+            )
+        if len(self._inline_pending) >= 1024:
+            return False
+        token = secrets.token_urlsafe(24)
+        self._inline_pending[token] = (
+            tool_name,
+            encoded_args,
+            now + self._cfg.ELICITATION_TIMEOUT_SECS,
+        )
+        return InputRequiredToolResult(
+            mt.InputRequiredResult(
+                input_requests={
+                    "olivetin_approval": mt.ElicitRequest(
+                        params=mt.ElicitRequestFormParams(
+                            message=f"Approve action {tool_name}?\nArguments: {encoded_args}",
+                            requested_schema={
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "boolean", "title": "Approve action"}
+                                },
+                                "required": ["value"],
+                            },
+                        ),
+                    )
+                },
+                request_state=json.dumps({"olivetin_approval": token}),
+            )
+        )
 
     # ── Elicitation (stage 1) ─────────────────────────────────────────────────
 
@@ -724,7 +851,7 @@ class ApprovalManager:
         token = secrets.token_urlsafe(16)
         base = self._cfg.APPROVAL_BASE_URL or f"http://localhost:{self._cfg.HOST_BRIDGE_PORT}"
         url = f"{base}/pending/{token}"
-        fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self._pending[token] = {
             "future": fut,
             "action_id": tool_name,
@@ -749,7 +876,7 @@ class ApprovalManager:
 
     def approve(self, token: str) -> bool:
         p = self._pending.get(token)
-        if p and not p["future"].done():
+        if p and p["expires_at"] > time.time() and not p["future"].done():
             p["future"].set_result(True)
             return True
         return False
@@ -794,7 +921,7 @@ async def _lifespan(_server: Any):
             olivetin_auth=_client.active_auth_modes(),
             approvals=f"{base}/pending/<token>",
             brave_search="configured" if BRAVE_API_KEY else "not configured",
-            sse=f"http://0.0.0.0:{cfg.HOST_BRIDGE_PORT}/sse",
+            network_listener=f"{cfg.HOST_BRIDGE_HOST}:{cfg.HOST_BRIDGE_PORT}",
         )
         await _registry.reload()
         stop_event = asyncio.Event()
@@ -843,7 +970,15 @@ class _ApprovalMiddleware(Middleware):
 
         approved: bool | None = None
         if fastmcp_ctx is not None:
-            approved = await _approvals.try_elicitation(tool_name, args, fastmcp_ctx)
+            request_context = getattr(fastmcp_ctx, "request_context", None)
+            protocol = getattr(request_context, "protocol_version", None)
+            if protocol in MODERN_PROTOCOL_VERSIONS:
+                decision = _approvals.modern_approval(tool_name, args, fastmcp_ctx)
+                if isinstance(decision, InputRequiredToolResult):
+                    return decision
+                approved = decision
+            else:
+                approved = await _approvals.try_elicitation(tool_name, args, fastmcp_ctx)
 
         if approved is None:
             display = _registry.display_name(tool_name)
@@ -854,7 +989,12 @@ class _ApprovalMiddleware(Middleware):
 
         if not approved:
             log.info("tool_denied", tool=tool_name)
-            return [mt.TextContent(type="text", text=f"⛔ Action '{tool_name}' was not approved.")]
+            return ToolResult(
+                content=[
+                    mt.TextContent(type="text", text=f"⛔ Action '{tool_name}' was not approved.")
+                ],
+                is_error=True,
+            )
 
         log.info("tool_approved", tool=tool_name)
         return await call_next(context)
@@ -919,7 +1059,8 @@ async def pending_approve_route(request: Request) -> HTMLResponse:
             _result_tmpl.render(icon="⏰", title="Expired", message="Already resolved or expired."),
             status_code=410,
         )
-    _approvals.approve(token)
+    if not _approvals.approve(token):
+        return _html_response("Already resolved or expired.", status_code=410)
     log.info("approved", tool=p["action_id"], token=token[:8])
     return _html_response(
         _result_tmpl.render(
@@ -939,7 +1080,8 @@ async def pending_deny_route(request: Request) -> HTMLResponse:
             _result_tmpl.render(icon="⏰", title="Expired", message="Already resolved or expired."),
             status_code=410,
         )
-    _approvals.deny(token)
+    if not _approvals.deny(token):
+        return _html_response("Already resolved or expired.", status_code=410)
     log.info("denied", tool=p["action_id"], token=token[:8])
     return _html_response(
         _result_tmpl.render(
@@ -961,7 +1103,7 @@ async def pending_deny_route(request: Request) -> HTMLResponse:
         "Call this after triggering a destructive action to get the approval link. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def list_pending_approvals() -> str:
     items = _approvals.list_pending()
@@ -984,7 +1126,7 @@ async def list_pending_approvals() -> str:
         "Returns top results with title, URL, and description. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def brave_search(query: str, count: int = 10) -> str:
     if not BRAVE_API_KEY:
@@ -1027,7 +1169,7 @@ async def _cleanup(path: str, delay: int = 60) -> None:
         "Render a Mermaid diagram spec as PNG via mermaid.ink. "
         "Returns /tmp path. No approval needed."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def render_diagram(spec: str) -> str:
     spec = spec.strip()
@@ -1061,7 +1203,7 @@ async def render_diagram(spec: str) -> str:
     description=(
         "Render a Chart.js config as PNG via quickchart.io. Returns /tmp path. No approval needed."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def render_chart(
     config: dict, width: int = 500, height: int = 300, background_color: str = "white"
@@ -1096,7 +1238,7 @@ async def render_chart(
         "List all available OliveTin actions: IDs, titles, argument schemas, "
         "and whether each requires approval. No approval needed."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def list_olivetin_actions() -> str:
     catalog = [
@@ -1137,7 +1279,7 @@ async def list_olivetin_actions() -> str:
         "Proto fields: datetime_started, action_title, output, exit_code, "
         "timed_out, user, execution_tracking_id, blocked. No approval needed."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def get_execution_logs(action_id: str = "", page_size: int = 50) -> str:
     try:
@@ -1156,7 +1298,7 @@ async def get_execution_logs(action_id: str = "", page_size: int = 50) -> str:
         "Check the status of a running OliveTin action by its execution_tracking_id "
         "(returned by StartAction). No approval needed."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def get_execution_status(execution_tracking_id: str) -> str:
     try:
@@ -1170,6 +1312,18 @@ async def get_execution_status(execution_tracking_id: str) -> str:
 
 
 @mcp.tool(
+    name="get_execution_queue",
+    description="List OliveTin execution groups, running actions, and queued work. Read-only.",
+    annotations=mt.ToolAnnotations(read_only_hint=True),
+)
+async def get_execution_queue() -> str:
+    try:
+        return json.dumps(await _client.call("GetExecutionQueue", {}), indent=2)
+    except Exception as exc:
+        return f"GetExecutionQueue error: {exc}"
+
+
+@mcp.tool(
     name="kill_action",
     description=(
         "Kill a currently running OliveTin action by its execution_tracking_id. "
@@ -1177,7 +1331,7 @@ async def get_execution_status(execution_tracking_id: str) -> str:
         "Returns killed/already_completed/not_found status. "
         "No approval needed — this is a safety stop, not a destructive write."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def kill_action(execution_tracking_id: str) -> str:
     try:
@@ -1195,7 +1349,7 @@ async def kill_action(execution_tracking_id: str) -> str:
         "Use get_execution_status to poll progress, kill_action to cancel. "
         "Requires human approval — this triggers a real action on the host."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=False, destructive_hint=True),
 )
 async def start_action_async(action_id: str, arguments: dict | None = None) -> str:
     if arguments is None:
@@ -1208,12 +1362,15 @@ async def start_action_async(action_id: str, arguments: dict | None = None) -> s
         if rate_exp:
             return f"Action '{action_id}' is rate-limited until {rate_exp}."
         return f"Action '{action_id}' cannot be executed right now (canExec=false)."
-    olivetin_args = [{"name": k, "value": str(v)} for k, v in arguments.items()]
+    try:
+        olivetin_args = _registry._validated_arguments(action, arguments)
+    except (ValueError, TypeError) as exc:
+        return f"Validation error: {exc}"
     tracking_id = secrets.token_urlsafe(16)
     try:
         result = await _client.call(
             "StartAction",
-            {"actionId": action_id, "arguments": olivetin_args, "uniqueTrackingId": tracking_id},
+            {"bindingId": action_id, "arguments": olivetin_args, "uniqueTrackingId": tracking_id},
         )
         return json.dumps(result, indent=2)
     except httpx.HTTPStatusError as exc:
@@ -1231,7 +1388,7 @@ async def start_action_async(action_id: str, arguments: dict | None = None) -> s
         "(RestartAction RPC). Re-runs with the same arguments as the original execution. "
         "Requires human approval — this re-triggers a real action on the host."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=False, destructive_hint=True),
 )
 async def restart_action(execution_tracking_id: str) -> str:
     try:
@@ -1252,7 +1409,7 @@ async def restart_action(execution_tracking_id: str) -> str:
         "type: unicode | ascii_identifier | url | int | float | bool. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def validate_argument(
     value: str, type: str, binding_id: str = "", argument_name: str = ""
@@ -1275,7 +1432,7 @@ async def validate_argument(
         "Return information about the current authenticated OliveTin user (WhoAmI RPC). "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def whoami() -> str:
     try:
@@ -1290,7 +1447,7 @@ async def whoami() -> str:
     description=(
         "Return OliveTin server info and version (Init RPC). No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def get_server_info() -> str:
     try:
@@ -1307,7 +1464,7 @@ async def get_server_info() -> str:
         "Returns full Action proto including arguments, icon, timeout, and ACL fields. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def get_action_binding(binding_id: str) -> str:
     try:
@@ -1324,7 +1481,7 @@ async def get_action_binding(binding_id: str) -> str:
         "Entities represent monitored services/hosts. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def get_entities() -> str:
     try:
@@ -1340,7 +1497,7 @@ async def get_entities() -> str:
         "Fetch a single OliveTin entity by unique key and type (GetEntity RPC). "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def get_entity(unique_key: str, type: str = "") -> str:
     try:
@@ -1360,7 +1517,7 @@ async def get_entity(unique_key: str, type: str = "") -> str:
         "Returns 200/ready when OliveTin is healthy. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def readyz() -> str:
     try:
@@ -1378,7 +1535,7 @@ async def readyz() -> str:
         "without waiting for the automatic refresh interval. "
         "No approval needed — read-only."
     ),
-    annotations=mt.ToolAnnotations(readOnlyHint=True),
+    annotations=mt.ToolAnnotations(read_only_hint=True),
 )
 async def reload_actions_tool() -> str:
     before = len(await _registry.snapshot())
@@ -1604,15 +1761,20 @@ async def prompt_olivetin_run(action_id: str, output_format: str = "plain") -> s
 
 
 def _run() -> None:  # pragma: no cover
-    """CLI entry point. Use --sse for SSE transport (Docker), default is stdio."""
-    import sys
+    """CLI entry point; stdio by default, --http or legacy --sse for network transport."""
+    import argparse
 
-    if "--sse" in sys.argv:
+    parser = argparse.ArgumentParser(description=__doc__)
+    transports = parser.add_mutually_exclusive_group()
+    transports.add_argument("--http", action="store_true", help="Streamable HTTP on /mcp")
+    transports.add_argument("--sse", action="store_true", help="Legacy SSE on /sse")
+    args = parser.parse_args()
+    if args.http or args.sse:
         mcp.run(
-            transport="sse",
-            host="0.0.0.0",
+            transport="http" if args.http else "sse",
+            host=cfg.HOST_BRIDGE_HOST,
             port=cfg.HOST_BRIDGE_PORT,
-            path="/sse",
+            path="/mcp" if args.http else "/sse",
             log_level="warning",
             show_banner=False,
         )

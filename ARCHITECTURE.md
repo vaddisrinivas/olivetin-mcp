@@ -5,7 +5,7 @@ This document describes the high-level architecture of olivetin-mcp for contribu
 ## Overview
 
 ```
-┌──────────────┐       SSE        ┌──────────────────┐      REST API      ┌──────────────┐
+┌──────────────┐    stdio/HTTP    ┌──────────────────┐      JSON RPC      ┌──────────────┐
 │  MCP Client  │ <──────────────> │   olivetin-mcp   │ ──────────────────> │   OliveTin   │
 │ (Claude, etc)│    port 9003     │  (this server)    │    port 1337       │  (host)      │
 └──────────────┘                  └──────────────────┘                     └──────────────┘
@@ -27,17 +27,17 @@ All code lives in `main.py` (~1500 lines). The architecture is organized into fo
 
 - Owns the `httpx.AsyncClient` connection pool
 - Constructs auth headers (3 modes: header, JWT, Basic — composable)
-- Wraps all API calls with `tenacity` retry (3 attempts, exponential backoff)
+- Retries known read RPCs with `tenacity` (3 attempts, exponential backoff); writes and unknown RPCs get one attempt
 - Single method: `call(endpoint, payload)` → `dict`
 
 ### `ActionRegistry`
 
 **Role**: Action catalog manager and MCP tool/prompt lifecycle.
 
-- Fetches `GetDashboard` from OliveTin, recursively walks the dashboard tree
+- Fetches `GetDashboard` from OliveTin, tolerates a null named dashboard, and recursively walks the default tree
 - Classifies actions as read-only (`[read-only]` title prefix or `ro_` binding ID) vs destructive
-- Builds Pydantic models from OliveTin `ActionArgument` proto for input validation
-- Registers/unregisters MCP tools and prompts dynamically on catalog refresh
+- Builds Pydantic models from OliveTin `ActionArgument` proto; forwards validated defaults and normalized string values, rejects unknown inputs and invalid choices
+- Registers/unregisters MCP tools and prompts dynamically on catalog refresh; validates new tools before replacing the working catalog; reserves built-in names
 - Manages per-action rate limiters via `aiolimiter`
 
 ### `ApprovalManager`
@@ -45,8 +45,11 @@ All code lives in `main.py` (~1500 lines). The architecture is organized into fo
 **Role**: Two-stage human approval gate for destructive actions.
 
 - **Stage 1 — MCP Elicitation**: Uses `ctx.elicit()` for inline dialog in Claude Desktop/Code. Times out after `ELICITATION_TIMEOUT_SECS` (default 30s).
+- **Modern protocol**: On MCP 2026-07-28, returns `InputRequiredToolResult` and consumes the continuation's single-use, expiring nonce before execution. State is bound to the exact tool/arguments; FastMCP seals it on the wire. These connections require an elicitation-capable client.
 - **Stage 2 — URL-based Pending**: Creates a cryptographic token, serves an HTML approval UI at `/pending/<token>`. Blocks the tool call until human clicks Approve/Deny or timeout.
-- Exposes pending queue via HTTP routes and MCP resources.
+- Exposes pending queue via HTTP routes and MCP resources. HTTP routes run only in network transports, not stdio.
+
+These are alternative approval paths: an accepted elicitation executes immediately. The client is trusted, and URL tokens do not authenticate a human. See [SECURITY.md](SECURITY.md) for deployment boundaries.
 
 ### `_ApprovalMiddleware`
 
@@ -93,6 +96,7 @@ Beyond dynamic OliveTin action tools, the server registers static tools:
 | `list_olivetin_actions` | Catalog discovery |
 | `get_execution_logs` | Execution history |
 | `get_execution_status` | Poll running action |
+| `get_execution_queue` | Inspect concurrency groups and queued work |
 | `kill_action` | Emergency stop |
 | `reload_actions` | Force catalog refresh |
 | `brave_search` | Web search (optional) |
@@ -122,16 +126,20 @@ Resources provide read-only data access:
 6. **Cryptographic tokens**: `secrets.token_urlsafe(16)` for approval URLs
 7. **Security headers**: `X-Frame-Options`, `CSP`, `X-Content-Type-Options` on all HTML responses
 8. **Rate limiting**: Per-action rate limits via `aiolimiter`
-9. **Retry resilience**: `tenacity` with exponential backoff on transient errors
+9. **Retry resilience**: `tenacity` with exponential backoff for known reads only; uncertain writes are never automatically repeated
 
 ## File Layout
 
 ```
 main.py                 # All server code (single-file architecture)
 olivetin_mcp.py         # Re-export for pip installability
-tests/test_main.py      # 200+ tests, ~100% coverage
+tests/test_main.py      # Existing unit suite
+tests/test_regressions.py # HTTP, MCP, validation, catalog, and approval regressions
+tests/test_integration.py # Opt-in real OliveTin/stdio/HTTP verification
+skills/                 # Reusable operator and action-author instructions
 Dockerfile              # Hardened production container
 pyproject.toml          # Package metadata, dependencies, tool config
 requirements.txt        # Docker build dependencies
+uv.lock                 # Exact dependency resolution; requirements.txt exports hashes
 .env.example            # Configuration reference
 ```
